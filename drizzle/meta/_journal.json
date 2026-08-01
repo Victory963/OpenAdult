@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1774690436367,
+      "tag": "0000_orange_toro",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1774690695944,
+      "tag": "0001_perfect_demogoblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1778576314865,
+      "tag": "0002_public_vector",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1780036307279,
+      "tag": "0003_right_shriek",
+      "breakpoints": true
+    }
+  ]
+}

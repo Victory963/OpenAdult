@@ -1,0 +1,26 @@
+{
+  // 新机器打开本仓库时，VS Code 会提示安装以下扩展。
+  // 命令面板 → "Extensions: Show Recommended Extensions" 可随时查看。
+  "recommendations": [
+    // --- 核心：语言与格式化 ---
+    "esbenp.prettier-vscode", // Prettier — 遵循仓库根目录的 .prettierrc
+    "bradlc.vscode-tailwindcss", // Tailwind CSS 4 类名补全与悬浮预览
+    "dbaeumer.vscode-eslint", // ESLint（仓库暂未配置，装上便于后续接入）
+
+    // --- 框架相关 ---
+    "dsznajder.es7-react-js-snippets", // React 19 代码片段
+    "christian-kohler.path-intellisense", // 路径补全（配合 @/ 与 @shared/ 别名）
+    "mikestead.dotenv", // .env 语法高亮
+
+    // --- 数据库 / 后端 ---
+    "ms-azuretools.vscode-docker", // Docker Compose 部署栈
+    "cweijan.vscode-mysql-client2", // 连接本地 MariaDB (127.0.0.1:3307)
+
+    // --- 测试与文档 ---
+    "vitest.explorer", // Vitest 测试面板
+    "bierner.markdown-mermaid", // 预览 docs/ 里的 mermaid 架构图
+
+    // --- AI 辅助 ---
+    "anthropic.claude-code" // Claude Code VS Code 扩展
+  ]
+}

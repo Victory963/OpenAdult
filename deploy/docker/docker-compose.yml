@@ -1,0 +1,207 @@
+# ============================================================
+# OpenAdult 生产环境 Docker Compose
+# 用途: 一键部署完整系统 (API + 转码 + CDN + 监控)
+# 使用: docker compose -f docker-compose.yml up -d
+# ============================================================
+
+# NOTE: `version` key removed — obsolete in Compose v2+ (it prints a warning).
+
+services:
+  # === DB マイグレーション (一次性; app 起動前に必ず適用) ===
+  # 修复: 以前从没有人执行 drizzle 迁移，外部 DB 的表永远不会被创建。
+  # 该一次性服务用 app 镜像跑 `drizzle-kit migrate`，成功后 app 才启动。幂等，可重复运行。
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.app
+    restart: "no"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    command: ["sh", "-c", "node_modules/.bin/drizzle-kit migrate"]  # 直接用本地 bin, 避免运行时下载 pnpm
+
+  # === 主应用 (Node.js API Server) ===
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.app
+    restart: always
+    ports:
+      - "3000:3000"
+      - "3001:3000"  # 第二个实例 (PM2 cluster)
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - VITE_APP_ID=${VITE_APP_ID}
+      - OAUTH_SERVER_URL=${OAUTH_SERVER_URL}
+      - VITE_OAUTH_PORTAL_URL=${VITE_OAUTH_PORTAL_URL}
+      - OWNER_OPEN_ID=${OWNER_OPEN_ID}
+      - OWNER_NAME=${OWNER_NAME}
+      - BUILT_IN_FORGE_API_URL=${BUILT_IN_FORGE_API_URL}
+      - BUILT_IN_FORGE_API_KEY=${BUILT_IN_FORGE_API_KEY}
+      - VITE_FRONTEND_FORGE_API_URL=${VITE_FRONTEND_FORGE_API_URL}
+      - VITE_FRONTEND_FORGE_API_KEY=${VITE_FRONTEND_FORGE_API_KEY}
+      - HERETIC_LLM_MODEL=${HERETIC_LLM_MODEL}
+      - VITE_ANALYTICS_ENDPOINT=${VITE_ANALYTICS_ENDPOINT}
+      - VITE_ANALYTICS_WEBSITE_ID=${VITE_ANALYTICS_WEBSITE_ID}
+      - VITE_APP_TITLE=${VITE_APP_TITLE}
+      - VITE_APP_LOGO=${VITE_APP_LOGO}
+      - CDN_BASE_URL=${CDN_BASE_URL}
+      - HLS_MODE=real
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    volumes:
+      - app-logs:/var/log/openadult
+    depends_on:
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+
+  # === Nginx 反向代理 ===
+  nginx:
+    image: nginx:1.25-alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/openadult-main.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../nginx/js-challenge.conf:/etc/nginx/conf.d/js-challenge.conf:ro
+      - ../nginx/cloudflare-ips.conf:/etc/nginx/conf.d/cloudflare-ips.conf:ro
+      - ../anti-block/challenge.html:/var/www/challenge/index.html:ro
+      - ssl-certs:/etc/nginx/ssl:ro
+      - ../../dist/public:/var/www/openadult/client/dist:ro
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # === OpenResty CDN 广告拼接节点 ===
+  openresty:
+    image: openresty/openresty:1.25.3.1-alpine
+    restart: always
+    ports:
+      - "8080:443"
+    volumes:
+      - ../openresty/openresty-cdn.conf:/etc/openresty/nginx.conf:ro
+      - ../openresty/lua:/etc/openresty/lua:ro
+      - cdn-cache:/data/cache
+      - ssl-certs:/etc/openresty/ssl:ro
+    environment:
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ENDPOINT=${S3_ENDPOINT}
+    depends_on:
+      - app
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4"
+
+  # === 转码服务 ===
+  transcoder:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.transcoder
+    restart: always
+    volumes:
+      - upload-data:/data/uploads
+      - hls-data:/data/hls
+      - ../ffmpeg:/opt/scripts:ro
+    environment:
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - KEY_SERVER_URL=http://app:3000/api/hls/key
+      - API_BASE=http://app:3000
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      - WATCH_DIR=/data/uploads
+    depends_on:
+      - app
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "8"
+
+  # === 域名轮换服务 ===
+  domain-rotator:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.rotator
+    restart: always
+    environment:
+      - CF_API_TOKEN=${CF_API_TOKEN}
+      - CF_ZONE_ID=${CF_ZONE_ID}
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - TG_CHANNEL_ID=${TG_CHANNEL_ID}
+      - ORIGIN_IP=${ORIGIN_IP}
+      - DOMAIN_POOL=${DOMAIN_POOL}
+      - API_CONFIG_URL=http://app:3000/api/system/update-config
+      - API_CONFIG_KEY=${ADMIN_API_KEY}
+    volumes:
+      - rotator-state:/var/lib/openadult
+      - rotator-logs:/var/log/openadult
+    depends_on:
+      - app
+
+  # === Redis (缓存 + 会话) ===
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  # === 监控 (Prometheus + Grafana) ===
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    restart: always
+    ports:
+      - "3100:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  app-logs:
+  ssl-certs:
+  cdn-cache:
+  upload-data:
+  hls-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  rotator-state:
+  rotator-logs:

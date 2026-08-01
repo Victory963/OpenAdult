@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.manus
+.manus-logs
+.env
+.env.*
+*.md
+!README.md
+deploy/docs
+.vscode
+.idea
+coverage
+*.log
+.DS_Store
+todo.md
+SETUP_GUIDE_BEGINNER.md

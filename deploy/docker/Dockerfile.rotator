@@ -1,0 +1,19 @@
+# ============================================================
+# OpenAdult 域名轮换服务 Dockerfile
+# Python + requests で定期的にドメイン健康チェック
+# ============================================================
+
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir requests
+
+WORKDIR /opt/rotator
+
+COPY deploy/anti-block/domain_rotator.py /opt/rotator/
+
+RUN mkdir -p /var/log/openadult /var/lib/openadult
+
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
+    CMD pgrep -f domain_rotator.py || exit 1
+
+CMD ["python", "-u", "domain_rotator.py"]

@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Check</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            text-align: center;
+            max-width: 400px;
+            padding: 2rem;
+        }
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid rgba(255,255,255,0.1);
+            border-top-color: #7c3aed;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1.5rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
+        p { color: #888; font-size: 0.875rem; }
+        .progress {
+            margin-top: 1.5rem;
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 100%;
+            background: #7c3aed;
+            width: 0%;
+            transition: width 0.3s;
+        }
+        noscript {
+            display: block;
+            background: #dc2626;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="spinner"></div>
+        <h1>Verifying your browser...</h1>
+        <p>This process is automatic. Your browser will redirect shortly.</p>
+        <div class="progress"><div class="progress-bar" id="progress"></div></div>
+        <noscript>
+            <p style="color:#fff">JavaScript is required to access this site.</p>
+        </noscript>
+    </div>
+
+    <script>
+    (function() {
+        'use strict';
+        
+        var progress = document.getElementById('progress');
+        var startTime = Date.now();
+        
+        // === Step 1: 浏览器指纹收集 ===
+        function collectFingerprint() {
+            var fp = {};
+            fp.ua = navigator.userAgent;
+            fp.lang = navigator.language;
+            fp.platform = navigator.platform;
+            fp.cores = navigator.hardwareConcurrency || 0;
+            fp.memory = navigator.deviceMemory || 0;
+            fp.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            fp.screen = screen.width + 'x' + screen.height + 'x' + screen.colorDepth;
+            fp.touch = 'ontouchstart' in window ? 1 : 0;
+            
+            // Canvas 指纹
+            try {
+                var canvas = document.createElement('canvas');
+                var ctx = canvas.getContext('2d');
+                ctx.textBaseline = 'top';
+                ctx.font = '14px Arial';
+                ctx.fillText('OpenAdult-FP', 2, 2);
+                fp.canvas = canvas.toDataURL().slice(-50);
+            } catch(e) { fp.canvas = 'err'; }
+            
+            // WebGL 指纹
+            try {
+                var gl = document.createElement('canvas').getContext('webgl');
+                var ext = gl.getExtension('WEBGL_debug_renderer_info');
+                fp.gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'none';
+            } catch(e) { fp.gpu = 'err'; }
+            
+            return fp;
+        }
+        
+        // === Step 2: Proof of Work (防止批量请求) ===
+        function proofOfWork(challenge, difficulty) {
+            // 找到一个 nonce 使得 SHA256(challenge + nonce) 前 difficulty 位为 0
+            var nonce = 0;
+            var prefix = '0'.repeat(difficulty);
+            
+            // 简单的 PoW (难度低，正常浏览器 <1秒完成)
+            while (nonce < 1000000) {
+                var hash = simpleHash(challenge + nonce);
+                if (hash.substring(0, difficulty) === prefix) {
+                    return { nonce: nonce, hash: hash };
+                }
+                nonce++;
+            }
+            return { nonce: nonce, hash: 'timeout' };
+        }
+        
+        // 简化的哈希函数 (不需要 crypto API)
+        function simpleHash(str) {
+            var hash = 0;
+            for (var i = 0; i < str.length; i++) {
+                var char = str.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+            }
+            // 转为16进制字符串
+            var hex = (hash >>> 0).toString(16);
+            while (hex.length < 8) hex = '0' + hex;
+            return hex + hex; // 简化版
+        }
+        
+        // === Step 3: 设置验证 Cookie ===
+        function setVerificationCookie(token) {
+            var expires = new Date();
+            expires.setTime(expires.getTime() + (24 * 60 * 60 * 1000)); // 24小时
+            document.cookie = 'js_verified=' + token + 
+                             ';expires=' + expires.toUTCString() + 
+                             ';path=/;SameSite=Lax;Secure';
+        }
+        
+        // === 执行验证流程 ===
+        progress.style.width = '20%';
+        
+        setTimeout(function() {
+            // 收集指纹
+            var fp = collectFingerprint();
+            progress.style.width = '50%';
+            
+            setTimeout(function() {
+                // 执行 PoW
+                var challenge = document.cookie + navigator.userAgent + Date.now().toString(36);
+                var pow = proofOfWork(challenge, 3); // 难度3 (约100ms)
+                progress.style.width = '80%';
+                
+                setTimeout(function() {
+                    // 生成验证 token
+                    var token = simpleHash(JSON.stringify(fp) + pow.hash + pow.nonce);
+                    token += '_' + Date.now().toString(36);
+                    
+                    // 设置 Cookie
+                    setVerificationCookie(token);
+                    progress.style.width = '100%';
+                    
+                    // 重定向回原始页面
+                    setTimeout(function() {
+                        var returnUrl = new URLSearchParams(window.location.search).get('return') || '/';
+                        window.location.href = returnUrl;
+                    }, 300);
+                    
+                }, 200);
+            }, 300);
+        }, 500);
+        
+    })();
+    </script>
+</body>
+</html>

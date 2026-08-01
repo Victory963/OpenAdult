@@ -1,0 +1,102 @@
+# ============================================================
+# OpenAdult — LOCALHOST 用 Docker Compose (自包含, 一条命令起)
+# ------------------------------------------------------------
+# 与生产 docker-compose.yml 的区别:
+#   - 内置 MariaDB (生产是外部 TiDB/MySQL)
+#   - 一次性 migrate 服务自动建表
+#   - HTTP-only nginx, 无 SSL / 无 Cloudflare 白名单 (可直接在 localhost 浏览)
+#   - 只跑观看应用所需的最小服务 (无 openresty/transcoder/rotator/监控)
+#   - OAuth/Forge/S3 留空 —— 应用会优雅降级
+#
+# 用法 (需要已安装 Docker):
+#   cd deploy/docker
+#   docker compose -f docker-compose.local.yml up -d --build
+#   # 打开 http://localhost:3000  (或经 nginx: http://localhost:8080)
+#   # 可选: 灌入示例数据
+#   docker compose -f docker-compose.local.yml --profile seed run --rm seed
+#
+# 停止: docker compose -f docker-compose.local.yml down     (加 -v 连数据卷一起删)
+# ============================================================
+
+services:
+  # === 内置数据库 (MySQL 协议; Drizzle/mysql2 直接连) ===
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      - MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes
+      - MARIADB_DATABASE=openadult
+    ports:
+      - "3307:3306"          # 方便宿主机用 mysql 客户端连 (可删)
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # === 一次性建表 (drizzle-kit migrate) ===
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.app
+    restart: "no"
+    environment:
+      - DATABASE_URL=mysql://root@db:3306/openadult
+    command: ["sh", "-c", "node_modules/.bin/drizzle-kit migrate"]  # 直接用本地 bin, 避免运行时下载 pnpm
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # === 主应用 (生产同款镜像/构建产物) ===
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=mysql://root@db:3306/openadult
+      - JWT_SECRET=local-dev-only-secret-key-change-me-0123456789abcdef
+      - HLS_MODE=pseudo
+      # OAuth / Forge / S3 故意留空 —— 应用会优雅降级 (仅相关功能不可用)。
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 10s
+      retries: 5
+
+  # === HTTP-only 反向代理 (演示生产拓扑; 可选) ===
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ../nginx/openadult-local.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_started
+
+  # === 可选: 灌入示例数据 (docker compose --profile seed run --rm seed) ===
+  seed:
+    image: mariadb:11.4
+    profiles: ["seed"]
+    entrypoint: ["sh", "-c", "mariadb -hdb -uroot openadult < /seed/dev-seed.sql && echo 'seeded ✅'"]
+    volumes:
+      - ../../scripts/dev-seed.sql:/seed/dev-seed.sql:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  db-data:

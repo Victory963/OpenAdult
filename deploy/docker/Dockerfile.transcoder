@@ -1,0 +1,38 @@
+# ============================================================
+# OpenAdult 转码服务 Dockerfile
+# FFmpeg + inotifywait で上传ディレクトリを監視し自動転码
+# ============================================================
+
+FROM ubuntu:22.04
+
+# FFmpeg + 必要ツールのインストール
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    inotify-tools \
+    curl \
+    awscli \
+    xxd \
+    openssl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 作業ディレクトリ
+WORKDIR /opt/scripts
+
+# スクリプトをコピー
+COPY deploy/ffmpeg/transcode_hls.sh /opt/scripts/
+COPY deploy/ffmpeg/transcode_ad.sh /opt/scripts/
+COPY deploy/ffmpeg/transcode_watcher.sh /opt/scripts/
+
+RUN chmod +x /opt/scripts/*.sh
+
+# データディレクトリ
+RUN mkdir -p /data/uploads /data/hls /data/ads /var/log/openadult
+
+# ヘルスチェック
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
+    CMD pgrep -f transcode_watcher.sh || exit 1
+
+# NOTE: compose 把 ../ffmpeg 以只读方式挂载到 /opt/scripts，覆盖了镜像层里 chmod +x 的副本。
+# 因此用 bash 显式解释脚本，避免依赖执行位（脚本在 repo 里现已带 +x，双保险）。
+CMD ["bash", "/opt/scripts/transcode_watcher.sh"]

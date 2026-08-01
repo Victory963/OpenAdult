@@ -32,12 +32,14 @@
  * ## ⚠️ 关键设计决策与坑
  * 1. **admin_credentials 表不在 drizzle/schema.ts 中**：它由 `ensureAdminCredentials()`
  *    在首次登录时用 `CREATE TABLE IF NOT EXISTS` 运行时自建，因此没有类型、没有迁移文件，
- *    也无法用 Drizzle 的查询构造器访问 —— 这正是下面全部走 `sql.raw` 裸 SQL 的原因。
+ *    也无法用 Drizzle 的查询构造器访问 —— 这正是下面全部走裸 SQL 的原因。
  * 2. **默认凭据 admin / admin**：表为空时自动播种。部署后**必须**立即通过
  *    `changeCredentials` 修改，否则等于管理面板无防护。
- * 3. **裸 SQL 字符串拼接**：所有查询用 `sql.raw` + 手工把 `'` 替换成 `''` 来转义。
- *    这是本文件最大的技术债（详见各函数上的 @remarks），正确做法是用参数化查询
- *    （Drizzle 的 `sql` 模板标签而非 `sql.raw`）。
+ * 3. **裸 SQL 一律参数化**：所有含外部输入的语句都用 Drizzle 的 `sql` 模板标签
+ *    （值被编译成 `?` 占位符，由 mysql2 驱动绑定），**不再**用 `sql.raw` 拼字符串。
+ *    只有完全静态、不含任何变量的 DDL / COUNT 语句仍走 `sql.raw`。
+ *    历史实现曾用 `sql.raw` + 手工把 `'` 替换成 `''` 转义，在 MySQL 默认模式
+ *    （未开启 NO_BACKSLASH_ESCAPES）下可被 `\'` 绕过，属于 SQL 注入漏洞，已修复。
  * 4. **密码用 bcrypt (cost=10) 哈希**，数据库中不存明文。
  */
 
@@ -131,7 +133,7 @@ function getAdminCookie(req: { headers: { cookie?: string } }): string | undefin
  * 这张表**没有**定义在 `drizzle/schema.ts` 里，也没有对应的迁移文件，
  * 而是在每次 `login` 前用 `CREATE TABLE IF NOT EXISTS` 惰性自建。
  * 这样做的好处是部署时无需额外迁移步骤；代价是它游离于 schema 之外，
- * 只能用裸 SQL 访问，且 `pnpm db:push` 不会管理它。
+ * 只能用裸 SQL（参数化的 `sql` 模板标签）访问，且 `pnpm db:push` 不会管理它。
  *
  * 播种逻辑：表内行数为 0 时，插入默认账号 **admin / admin**（密码经 bcrypt cost=10 哈希）。
  *
@@ -165,11 +167,10 @@ async function ensureAdminCredentials() {
       // bcrypt cost factor = 10：约 2^10 轮加盐迭代，是 bcrypt 的通用默认值，
       // 在「单次哈希约 50~100ms」与「抗暴力破解」之间取平衡。
       const hashed = await bcrypt.hash("admin", 10);
-      // bcrypt 输出是 [./A-Za-z0-9$] 字符集，本不含单引号，
-      // 这行转义纯属防御性写法（因为下面用的是 sql.raw 字符串拼接而非参数化查询）。
-      const escapedHash = hashed.replace(/'/g, "''");
+      // 修复：SQL 注入 —— 改用参数化的 `sql` 模板标签（值编译为 `?` 由驱动绑定），
+      // 不再用 sql.raw 拼接 + 手工 `'`→`''` 转义。
       await db.execute(
-        sql.raw(`INSERT INTO admin_credentials (username, passwordHash) VALUES ('admin', '${escapedHash}')`)
+        sql`INSERT INTO admin_credentials (username, passwordHash) VALUES ('admin', ${hashed})`
       );
     }
   } catch (e) {
@@ -218,8 +219,7 @@ export const adminAuthRouter = router({
    *   避免通过错误信息枚举出有效用户名。
    *   但两条分支的耗时不同（前者不跑 bcrypt），理论上存在时序侧信道。
    * - ⚠️ 无登录失败次数限制 / 无验证码 / 无锁定，可被在线暴力破解。
-   * - ⚠️ 用户名以 `sql.raw` 拼进 SQL，仅把 `'` 替换成 `''`。在 MySQL 默认
-   *   （未开启 NO_BACKSLASH_ESCAPES）下反斜杠仍是转义符，该手工转义不足以完全防注入。
+   * - 用户名以参数化占位符传入（`sql` 模板标签），不参与 SQL 文本拼接，无注入风险。
    */
   login: publicProcedure
     .input(
@@ -234,11 +234,11 @@ export const adminAuthRouter = router({
       if (!db)
         throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "データベースに接続できません" });
 
-      // 因 admin_credentials 不在 Drizzle schema 中，只能走 sql.raw 裸 SQL。
-      // 这里把单引号翻倍是 SQL 标准的字符串转义，但对 MySQL 的反斜杠转义无效（见上方 @remarks）。
-      const escapedUsername = input.username.replace(/'/g, "''");
+      // 因 admin_credentials 不在 Drizzle schema 中，只能走裸 SQL；
+      // 修复：SQL 注入 —— 用 `sql` 模板标签而非 sql.raw，用户名被编译成 `?` 占位符
+      // 由 mysql2 驱动绑定，彻底摆脱手工转义（原先的 `'`→`''` 可被 `\'` 绕过）。
       const rows = await db.execute(
-        sql.raw(`SELECT id, username, passwordHash FROM admin_credentials WHERE username = '${escapedUsername}' LIMIT 1`)
+        sql`SELECT id, username, passwordHash FROM admin_credentials WHERE username = ${input.username} LIMIT 1`
       );
       const row = (rows as any)[0]?.[0] ?? null;
       // 用户不存在、或该行没有密码哈希（脏数据），都走同一条「凭据错误」分支
@@ -302,7 +302,7 @@ export const adminAuthRouter = router({
    * - 改完立即换发新 token 并覆盖 cookie：因为 JWT payload 里带着 username，
    *   改名后不换发的话，旧 token 会指向一个已不存在的用户名，导致下次操作报 NOT_FOUND。
    * - 定位记录用的是 token 中的 username，而非客户端传参，避免越权修改他人账号。
-   * - ⚠️ 同样是 `sql.raw` 字符串拼接（详见 login 的 @remarks），新用户名可控，注入面更大。
+   * - 新用户名/新哈希同样以参数化占位符写入（`sql` 模板标签），不参与 SQL 文本拼接。
    * - ⚠️ 未校验新用户名是否与现有账号冲突；表上 username 有 UNIQUE 约束，
    *   撞名时会抛出原始 MySQL 错误而非友好提示。
    */
@@ -327,9 +327,9 @@ export const adminAuthRouter = router({
         throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "データベースに接続できません" });
 
       // 用 token 里的 username（而非客户端入参）定位记录，杜绝改他人凭据
-      const escapedCurrentUsername = payload.username.replace(/'/g, "''");
+      // 修复：SQL 注入 —— 参数化占位符替代 sql.raw 字符串拼接
       const rows = await db.execute(
-        sql.raw(`SELECT id, username, passwordHash FROM admin_credentials WHERE username = '${escapedCurrentUsername}' LIMIT 1`)
+        sql`SELECT id, username, passwordHash FROM admin_credentials WHERE username = ${payload.username} LIMIT 1`
       );
       const row = (rows as any)[0]?.[0] ?? null;
       if (!row || !row.passwordHash)
@@ -343,12 +343,12 @@ export const adminAuthRouter = router({
       // 避免把管理员账号改成空名而彻底锁死后台。
       const newUsername = input.newUsername?.trim() || payload.username;
       const newHash = await bcrypt.hash(input.newPassword, 10); // cost=10，与播种时保持一致
-      const escapedNewUsername = newUsername.replace(/'/g, "''");
-      const escapedNewHash = newHash.replace(/'/g, "''");
 
       // 用主键 id 定位（而非 username），保证即使改名也精确命中同一行
+      // 修复：SQL 注入 —— newUsername 完全由调用方控制，这里是注入面最大的一处；
+      // 改为参数化占位符后，任何引号/反斜杠都只会被当作普通字符存入。
       await db.execute(
-        sql.raw(`UPDATE admin_credentials SET username = '${escapedNewUsername}', passwordHash = '${escapedNewHash}' WHERE id = ${row.id}`)
+        sql`UPDATE admin_credentials SET username = ${newUsername}, passwordHash = ${newHash} WHERE id = ${row.id}`
       );
 
       // 换发 token：旧 token 的 payload.username 可能已过期（改名场景），

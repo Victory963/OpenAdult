@@ -61,7 +61,8 @@ import path from "path";
 //   totalSize    — 客户端声明的文件字节数（仅用于 initSession 阶段的大小校验，之后未再使用）。
 //   uploadedAt   — 会话创建时间，供下方定时清理判断是否过期。
 //   thumbnailData/duration — 客户端预先在浏览器端抽取的封面(data URL)与时长；
-//                  V1 接收但**并未写入数据库**（V2 才真正落地，见 v2 的 completeUpload）。
+//                  completeUpload 时封面会被解码上传到 S3、时长直接写入 videos 行
+//                  （与 V2 的 completeUpload 行为一致）。
 const uploadSessions = new Map<string, {
   chunks: Map<number, Buffer>;
   totalChunks: number;
@@ -104,8 +105,8 @@ export const videoUploadRouter = router({
    * @param input.fileName      原始文件名，用于扩展名白名单校验，并作为后续 LLM 推断标题的输入
    * @param input.fileSize      文件总字节数，仅用于 100GB 上限校验
    * @param input.totalChunks   客户端切分出的分片总数，completeUpload 以此判定是否收齐
-   * @param input.thumbnailData 可选，浏览器端抽取的封面 data URL（V1 存了但未使用）
-   * @param input.duration      可选，视频时长（秒）（V1 存了但未使用）
+   * @param input.thumbnailData 可选，浏览器端抽取的封面 data URL（completeUpload 时上传 S3）
+   * @param input.duration      可选，视频时长（秒）（completeUpload 时写入 videos.duration）
    * @returns { sessionId, message } sessionId 是后续所有 procedure 的唯一句柄
    *
    * @throws TRPCError FORBIDDEN    非 admin
@@ -251,9 +252,10 @@ export const videoUploadRouter = router({
    * 副作用（按发生顺序，注意本流程**不是事务性的**）：
    *   1) 写 S3：`videos/<userId>/<timestamp>-<原文件名>`（storagePut）
    *   2) 调 LLM：invokeLLM 依据文件名推断 title/description/category（失败可降级）
-   *   3) 写库：向 `videos` 表 INSERT 一行
-   *   4) 清理：从内存删除该会话
-   * 若第 3 步失败，第 1 步已写入 S3 的对象不会被回滚，会成为孤儿文件。
+   *   3) 写 S3：封面 `thumbnails/<userId>/<ts>-thumb.jpg`（仅当会话里有 thumbnailData，失败可降级）
+   *   4) 写库：向 `videos` 表 INSERT 一行（含 thumbnailUrl 与 duration）
+   *   5) 清理：从内存删除该会话
+   * 若第 4 步失败，前面已写入 S3 的对象不会被回滚，会成为孤儿文件。
    *
    * @param input.sessionId 会话句柄
    * @returns { success, videoId, videoUrl, storageKey, metadata, message }
@@ -384,6 +386,33 @@ export const videoUploadRouter = router({
           // 降级：保留上面用文件名构造的 aiAnalysis，流程继续。
         }
 
+        // Upload thumbnail to S3 if available
+        // 修复：initSession 收到的 thumbnailData / duration 此前被完全丢弃，导致 V1
+        // 上传的视频永远没有封面、时长恒为 0；这里改为与 V2
+        //（video-upload-v2.ts completeUpload）一致的处理方式，真正落地这两个字段。
+        // 封面来自客户端在浏览器里用 <video>+canvas 抽帧得到的 data URL
+        //（形如 `data:image/jpeg;base64,xxxx`），正则捕获组剥掉 MIME 前缀后只取纯载荷；
+        // 不是合法 data URL 则整体跳过，thumbnailUrl 保持 null。
+        // 整段可降级（try/catch 只打日志）：封面处理失败不应阻断已上传成功的视频入库。
+        let thumbnailUrl: string | null = null;
+        // duration 列是 MySQL int（秒），客户端给的是浮点秒数，故取整后写入。
+        const videoDuration = session.duration ? Math.round(session.duration) : 0;
+        try {
+          if (session.thumbnailData) {
+            const base64Match = session.thumbnailData.match(/^data:image\/\w+;base64,(.+)$/);
+            if (base64Match) {
+              const thumbnailBuffer = Buffer.from(base64Match[1], "base64");
+              // 封面 key 用时间戳命名（与 V2 一致），contentType 恒为 image/jpeg
+              //（前端抽帧固定导出 JPEG）。
+              const thumbnailKey = `thumbnails/${ctx.user.id}/${Date.now()}-thumb.jpg`;
+              const { url: thumbUrl } = await storagePut(thumbnailKey, thumbnailBuffer, "image/jpeg");
+              thumbnailUrl = thumbUrl;
+            }
+          }
+        } catch (e) {
+          console.error("[Video Upload] Error processing thumbnail:", e);
+        }
+
         // Create video record in database
         const db = await getDb();
         if (!db) throw new Error("Database not available");
@@ -391,14 +420,14 @@ export const videoUploadRouter = router({
         // 落库：videoUrl 直接存 storagePut 返回的**绝对 URL**。
         // 与 V2 不同 —— V2 存的是相对路径 `/manus-storage/<key>`（走服务端存储代理），
         // 两者混存会让前端 videoUrl 处理逻辑（client/src/lib/videoUrl.ts）必须兼容两种形态。
-        // duration/thumbnailUrl 在 V1 一律不写：即便 initSession 收到了 duration 与
-        // thumbnailData 也被丢弃，因此 V1 上传的视频没有封面、时长恒为 0。
+        // thumbnailUrl 同样是绝对 URL（与 V2 的封面形态一致）。
         const result = await db.insert(videos).values({
           title: aiAnalysis.title,
           description: aiAnalysis.description,
           videoUrl: url,
+          thumbnailUrl,
           category: aiAnalysis.category,
-          duration: 0, // Will be updated later if needed
+          duration: videoDuration,
           tags: [],
           views: 0,
           rating: "0",

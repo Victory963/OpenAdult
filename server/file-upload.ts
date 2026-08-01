@@ -42,7 +42,8 @@ import { storagePut, storageGet } from "./storage";
 import { invokeLLM } from "./_core/llm";
 import { getDb } from "./db";
 import { userUploads } from "../drizzle/schema";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { TRPCError } from "@trpc/server";
 
 /**
  * ファイルアップロードとAI分析ルーター
@@ -359,9 +360,11 @@ export const fileUploadRouter = router({
    * @param input.limit  每页条数，默认 20。⚠️ 未设服务端上限，客户端可传超大值。
    * @param input.offset 偏移量，默认 0
    * @returns `{ uploads, total }`
-   *          ⚠️ `total` 返回的是**本页条数**（`uploads.length`）而非总记录数，
-   *             用它来算总页数会得到错误结果（见 observations）。
-   * @副作用 只读。数据库不可用时降级为空结果而非抛错。
+   *          - `uploads`：本页记录；
+   *          - `total`：该用户的**总记录数**（不受 limit/offset 影响），
+   *            前端可用 `Math.ceil(total / limit)` 直接算出总页数。
+   * @副作用 只读（两条查询：一条取本页数据，一条 COUNT(*) 取总数）。
+   *         数据库不可用时降级为空结果而非抛错。
    * @throws "アップロード履歴の取得に失敗しました"
    */
   getUploadHistory: protectedProcedure
@@ -392,9 +395,18 @@ export const fileUploadRouter = router({
           .limit(input.limit)
           .offset(input.offset);
 
+        // 修复：原先 total 返回的是 uploads.length（本页条数），
+        // 前端 Math.ceil(total / limit) 永远得到 1，分页控件失效。
+        // 这里额外发一条 COUNT(*) 取该用户的真实总记录数。
+        // Number() 是必须的：mysql2 会把 COUNT(*) 以字符串形式返回。
+        const totalRows = await database
+          .select({ count: sql<number>`count(*)` })
+          .from(userUploads)
+          .where(eq(userUploads.userId, ctx.user.id));
+
         return {
           uploads,
-          total: uploads.length,
+          total: Number(totalRows[0]?.count ?? 0),
         };
       } catch (error) {
         console.error("[Upload History] Error:", error);
@@ -413,9 +425,10 @@ export const fileUploadRouter = router({
    * @param input.uploadId user_uploads 主键
    * @returns `{ success, message }`
    * @副作用 写库（删除一行）。**S3 上的实际文件会被保留成孤儿对象**（见 observations）。
-   * @throws "アップロード削除に失敗しました" —— 注意 catch 块把内部的
-   *         「見つかりません」/「権限がありません」都覆盖成了这句通用文案，
-   *         前端无法区分"不存在"与"无权限"（见 observations）。
+   * @throws TRPCError(NOT_FOUND)  「アップロードが見つかりません」—— 记录不存在
+   * @throws TRPCError(FORBIDDEN)  「このアップロードを削除する権限がありません」—— 记录不属于当前用户
+   * @throws Error "アップロード削除に失敗しました" —— 仅用于数据库/未知故障；
+   *         上面两种业务错误会原样抛出，前端可据 tRPC 错误码区分三种情况。
    */
   deleteUpload: protectedProcedure
     .input(
@@ -440,12 +453,20 @@ export const fileUploadRouter = router({
           .where(eq(userUploads.id, input.uploadId))
           .limit(1);
 
+        // 修复：改用 TRPCError 并带上语义化错误码，且下方 catch 会原样放行，
+        // 让前端能区分「记录不存在」(NOT_FOUND) 与「无权限」(FORBIDDEN)。
         if (!upload || upload.length === 0) {
-          throw new Error("アップロードが見つかりません");
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "アップロードが見つかりません",
+          });
         }
 
         if (upload[0].userId !== ctx.user.id) {
-          throw new Error("このアップロードを削除する権限がありません");
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "このアップロードを削除する権限がありません",
+          });
         }
 
         // ⚠️ 只删数据库行，没有对应的 S3 删除调用（storage.ts 也未提供 storageDelete），
@@ -462,6 +483,12 @@ export const fileUploadRouter = router({
         };
       } catch (error) {
         console.error("[Delete Upload] Error:", error);
+        // 修复：原先无差别地把所有异常重写成同一句通用文案，
+        // 「記録なし」「権限なし」「DB 故障」三种情况在前端完全无法区分。
+        // 现在业务错误（TRPCError）原样向上抛，只有真正的未知/数据库故障才兜底。
+        if (error instanceof TRPCError) {
+          throw error;
+        }
         throw new Error("アップロード削除に失敗しました");
       }
     }),

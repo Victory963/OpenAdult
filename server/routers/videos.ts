@@ -403,22 +403,30 @@ export const videosRouter = router({
         // views/rating 显式写死初值而不依赖列默认值，保证新片在按热度/评分排序时
         // 一定参与比较（NULL 在 MySQL 的 ORDER BY DESC 中会排到最后，行为不直观）。
         // Create video
-        const result = await db.insert(videos).values({
-          title: input.title,
-          description: input.description,
-          videoUrl: input.videoUrl,
-          thumbnailUrl: input.thumbnailUrl,
-          category: input.category,
-          duration: input.duration,
-          tags: input.tags || [],
-          views: 0,
-          rating: "0",
-        });
+        const inserted = await db
+          .insert(videos)
+          .values({
+            title: input.title,
+            description: input.description,
+            videoUrl: input.videoUrl,
+            thumbnailUrl: input.thumbnailUrl,
+            category: input.category,
+            duration: input.duration,
+            tags: input.tags || [],
+            views: 0,
+            rating: "0",
+          })
+          .$returningId();
 
-        // 直接读取 MySQL 驱动返回的自增主键。`as any` 是因为 Drizzle 的 MySQL insert
-        // 返回类型未暴露 insertId 字段。相比 V2 的「插入后按 title 倒序回查」，
-        // 这种取法更准确（V2 那种回查在同名视频并发创建时会拿错行）。
-        const videoId = (result as any).insertId;
+        // 修复：原写法 `(result as any).insertId` 恒为 undefined。
+        // drizzle-orm/mysql2 对 INSERT 返回的是 **数组** `[ResultSetHeader, FieldPacket[]]`
+        // （见 node_modules/drizzle-orm/mysql2/session.cjs 的 execute），数组上没有
+        // insertId 属性；拿到 undefined 后再去插 video_actresses，会因 videoId 是
+        // NOT NULL 列而报 MySQL 错误（带 actressIds 建视频必定 500），且返回给前端的
+        // videoId 也是 undefined。
+        // 改用 Drizzle 官方的 `$returningId()`：它按自增主键把 insertId 还原成
+        // `[{ id: number }]`，比 V2 的「插入后按 title 倒序回查」准确（无并发竞态）。
+        const videoId = inserted[0].id;
 
         // 逐条插入关联关系。条数通常个位数，串行开销可忽略；
         // 但注意这里没有校验 actressId 是否真实存在，脏 ID 会静默写入产生孤儿关联。
@@ -452,11 +460,11 @@ export const videosRouter = router({
    * @权限 admin（同 `create`，在 handler 内手写 role 检查）
    * @param input.videoId    要更新的视频 ID。
    * @param input.title/description/category/tags 均为可选的元数据字段。
-   *        这里把 `input.xxx` 原样塞进 `.set()`，未传的字段值为 `undefined`；
-   *        Drizzle 的 `mapUpdateSet()` 会自动剔除 undefined 项，所以「只更新传入字段」
-   *        的语义是成立的（与 V2 手工构建 `updateData` 等价）。
-   *        ⚠️ 但当四个元数据字段**全部**不传（只想改女优关联）时，SET 子句会变空，
-   *        Drizzle 直接抛 `Error("No values to set")` —— 详见 observations。
+   *        handler 内按 `!== undefined` 收集进 `updateData` 后才执行 UPDATE，
+   *        因此「只更新传入字段」的语义是成立的（与 V2 手工构建 `updateData` 一致）。
+   *        四个元数据字段**全部**不传（即只想改女优关联）时会直接**跳过** UPDATE：
+   *        必须跳过，否则 SET 子句为空，Drizzle 的 `mapUpdateSet()` 会抛
+   *        `Error("No values to set")`，女优关联根本没机会更新。
    * @param input.actressIds 传入时会**先删后插**整体替换该视频的女优关联；
    *                         不传（undefined）则保持原有关联不变；传空数组 `[]` 表示清空关联。
    * @returns `{ success: true, message }` —— 不返回更新后的行，前端需自行 invalidate 查询缓存。
@@ -490,16 +498,24 @@ export const videosRouter = router({
       }
 
       try {
+        // 修复：只把显式传入的字段收进 updateData，并在 updateData 为空时跳过 UPDATE。
+        // 原先直接把四个可能为 undefined 的字段塞进 .set()，当调用方只传
+        // { videoId, actressIds }（只想改女优关联）时，Drizzle 的 mapUpdateSet()
+        // 剔除 undefined 后 entries 为空，会抛 Error("No values to set")，
+        // 被下面的 catch 包成 INTERNAL_SERVER_ERROR，女优关联那段代码根本走不到。
         // Update video
-        await db
-          .update(videos)
-          .set({
-            title: input.title,
-            description: input.description,
-            category: input.category,
-            tags: input.tags,
-          })
-          .where(eq(videos.id, input.videoId));
+        const updateData: any = {};
+        if (input.title !== undefined) updateData.title = input.title;
+        if (input.description !== undefined) updateData.description = input.description;
+        if (input.category !== undefined) updateData.category = input.category;
+        if (input.tags !== undefined) updateData.tags = input.tags;
+
+        if (Object.keys(updateData).length > 0) {
+          await db
+            .update(videos)
+            .set(updateData)
+            .where(eq(videos.id, input.videoId));
+        }
 
         // ===== 女优关联「全量替换」策略 =====
         // 先删光该视频的全部关联，再按入参重建。之所以不做差集增量更新：

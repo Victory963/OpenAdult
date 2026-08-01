@@ -92,10 +92,10 @@ function buildUploadUrl(baseUrl: string, relKey: string): URL {
  * @param baseUrl 代理基础 URL
  * @param relKey  对象相对 key
  * @param apiKey  Bearer Token
- * @returns 下载 URL 字符串
- *
- * ⚠️ 未校验 `response.ok`：代理返回 4xx/5xx 时这里会解析错误响应体，
- *    结果是返回 undefined 或抛出难以定位的 JSON 解析异常。保留原样，见 observations。
+ * @returns 下载 URL 字符串 (保证是非空字符串)
+ * @throws HTTP 非 2xx 时抛出包含状态码与响应体的 Error (与 storagePut 的错误路径一致)；
+ *         响应体不是合法 JSON、或 JSON 中缺少 `url` 字段时同样抛错，
+ *         避免把 undefined 传给调用方 (如 hlsRoutes 会拿它去 fetch)。
  */
 async function buildDownloadUrl(
   baseUrl: string,
@@ -111,7 +111,30 @@ async function buildDownloadUrl(
     method: "GET",
     headers: buildAuthHeaders(apiKey),
   });
-  return (await response.json()).url;
+
+  // 修复：补上此前遗漏的 `response.ok` 校验。
+  // 代理返回 4xx/5xx 时，响应体可能是 JSON 错误对象 (解析后没有 url → 返回 undefined)，
+  // 也可能是网关的 HTML/纯文本 (直接抛 "Unexpected token" 之类的解析异常)。
+  // 两种情况都会把真实原因掩盖掉，因此改为与 storagePut 相同的 fail-fast 错误路径。
+  if (!response.ok) {
+    const message = await response.text().catch(() => response.statusText);
+    throw new Error(
+      `Storage downloadUrl failed (${response.status} ${response.statusText}): ${message}`
+    );
+  }
+
+  // 修复：即使 HTTP 200，也可能因代理协议变更而缺少 url 字段；
+  // 此处显式校验，保证函数的返回值真的满足 Promise<string> 契约。
+  const payload = (await response.json().catch(() => null)) as
+    | { url?: unknown }
+    | null;
+  const url = payload?.url;
+  if (typeof url !== "string" || url.length === 0) {
+    throw new Error(
+      `Storage downloadUrl returned no url for key "${normalizeKey(relKey)}"`
+    );
+  }
+  return url;
 }
 
 /** 保证 URL 以 `/` 结尾，供 `new URL(relative, base)` 正确拼接子路径。 */
@@ -213,8 +236,9 @@ export async function storagePut(
  * 可能仍返回一个签名 URL，实际访问时才 404。调用方 (如 HLS 路由) 需要自行处理。
  *
  * @param relKey 对象相对 key
- * @returns `{ key, url }`：url 为临时下载地址，不应持久化存储
- * @throws 配置缺失时抛错；代理返回异常响应时可能抛出 JSON 解析错误 (见 buildDownloadUrl)
+ * @returns `{ key, url }`：url 为临时下载地址 (保证是非空字符串)，不应持久化存储
+ * @throws 配置缺失时抛错；代理返回非 2xx 或响应体缺少 url 字段时抛出带状态码/原因的
+ *         Error (见 buildDownloadUrl)，调用方应自行 try/catch 降级
  *
  * 副作用：一次到存储代理的网络请求 (只读，不修改对象)。
  */

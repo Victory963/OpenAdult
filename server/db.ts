@@ -212,13 +212,17 @@ export async function getVideoById(videoId: number) {
 }
 
 /**
- * 视频文本搜索（**当前为未完成的占位实现**）。
+ * 视频文本搜索（基于 LIKE 的模糊匹配，可后续升级为全文检索）。
  *
- * 注意：`query` 参数目前被完全忽略，函数实际返回的是「前 limit 条视频」而非搜索结果。
- * 已有注释标注计划改为全文检索 (MySQL FULLTEXT / 外部搜索引擎)。
- * 真正对外的搜索逻辑目前在 server/search.ts 与 server/routers/videos-v2.ts 中用 LIKE 实现。
+ * 匹配规则：关键词按空白/逗号/顿号等切分，任一关键词命中
+ * `title` / `description` / `category` 之一即算召回（OR 语义，宽召回）。
+ * 结果按播放量降序，便于前端直接展示。
  *
- * @param query 搜索关键词（当前未生效）
+ * 坑：`%kw%` 前置通配符使 MySQL 无法走索引，视频量大时会全表扫描；
+ *     关键词中的 `%` 与 `_` 未做转义（Drizzle 只做参数绑定，不转义 LIKE 元字符），
+ *     最坏情况只是召回过宽，不存在注入风险。
+ *
+ * @param query 搜索关键词；为空/仅空白时退化为「按播放量返回热门视频」
  * @param limit 返回条数上限，默认 20
  * @returns 视频数组；数据库不可用时为空数组
  *
@@ -228,8 +232,29 @@ export async function searchVideos(query: string, limit: number = 20) {
   const db = await getDb();
   if (!db) return [];
 
-  // Simple text search - can be enhanced with full-text search
-  return await db.select().from(videos).limit(limit);
+  // 修复：原实现完全忽略 `query`，对任何关键词都返回相同的前 N 条视频，
+  // 函数签名与行为不符。这里改为真正按关键词做 LIKE 匹配。
+  const keywords = (query ?? "")
+    .split(/[\s+,、。・　]+/)
+    .filter((w) => w.length >= 1);
+
+  // 无有效关键词时退化为热门视频列表（而不是随机的「前 limit 条」）。
+  if (keywords.length === 0) {
+    return await db.select().from(videos).orderBy(desc(videos.views)).limit(limit);
+  }
+
+  const conditions = keywords.flatMap((kw) => [
+    like(videos.title, `%${kw}%`),
+    like(videos.description, `%${kw}%`),
+    like(videos.category, `%${kw}%`),
+  ]);
+
+  return await db
+    .select()
+    .from(videos)
+    .where(or(...conditions))
+    .orderBy(desc(videos.views))
+    .limit(limit);
 }
 
 // ===== 女优查询 (Actress queries) =====
@@ -719,12 +744,8 @@ export async function clearUserRecommendations(userId: number) {
  * @param totalDuration 视频总时长 (秒)，写入 duration 列
  * @returns update/insert 结果；数据库不可用或出错时为 null
  *
- * 副作用：写 `resume_playback` 表。
+ * 副作用：写 `resume_playback` 表 (只影响 (userId, videoId) 这一行)。
  * 权限：protectedProcedure。
- *
- * ⚠️ 已知问题：下面的 WHERE 条件用的是 JavaScript 的 `&&` 而不是 Drizzle 的 `and(...)`。
- *    `&&` 会直接返回右侧操作数 (SQL 条件对象是 truthy)，因此实际生成的条件
- *    **只有 videoId 过滤，丢失了 userId 过滤**。这里保留原样不做修改，详见返回的 observations。
  */
 export async function trackWatchBehavior(userId: number, videoId: number, watchDuration: number, totalDuration: number) {
   const db = await getDb();
@@ -732,8 +753,12 @@ export async function trackWatchBehavior(userId: number, videoId: number, watchD
 
   try {
     // Update or insert resume playback record
+    // 修复：WHERE 条件原本写成 JS 的 `A && B`，由于 SQL 条件对象恒为 truthy，
+    // `&&` 只会返回右操作数 → userId 过滤被静默丢弃，导致 SELECT 读到他人记录、
+    // UPDATE 覆盖该视频下所有用户的进度 (跨用户数据污染)。
+    // 改用 Drizzle 的 and(...) 组合，与同文件 updateResumePlayback 保持一致。
     const existing = await db.select().from(resumePlayback)
-      .where(eq(resumePlayback.userId, userId) && eq(resumePlayback.videoId, videoId))
+      .where(and(eq(resumePlayback.userId, userId), eq(resumePlayback.videoId, videoId)))
       .limit(1);
 
     if (existing.length > 0) {
@@ -743,7 +768,7 @@ export async function trackWatchBehavior(userId: number, videoId: number, watchD
           duration: totalDuration,
           lastWatchedAt: new Date(),
         })
-        .where(eq(resumePlayback.userId, userId) && eq(resumePlayback.videoId, videoId));
+        .where(and(eq(resumePlayback.userId, userId), eq(resumePlayback.videoId, videoId)));
     } else {
       return await db.insert(resumePlayback).values({
         userId,

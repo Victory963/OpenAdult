@@ -170,6 +170,18 @@ export const appRouter = router({
         // Get chat history for context
         const history = await getChatHistory(userId, 10);
 
+        // 修复：getChatHistory 返回的是「最新在前」的倒序，必须翻转成正序（旧 → 新）
+        // 才能作为 LLM 的对话上下文，否则模型看到的是逆序对话，多轮连贯性会退化。
+        // （对照 chat.getHistory 的 `messages.reverse()`，那里也是同样的原因。）
+        const orderedHistory = [...history].reverse();
+
+        // 修复：本轮用户消息在上面已经 saveChatMessage 落库，因此它**必然**是
+        // orderedHistory 的最后一条；若再无条件追加一次，模型会看到重复提问。
+        // 这里只在历史末尾不是本轮消息时才补追加（防御 saveChatMessage 静默失败的情况）。
+        const lastHistoryMsg = orderedHistory[orderedHistory.length - 1];
+        const historyHasCurrentMessage =
+          lastHistoryMsg?.role === "user" && lastHistoryMsg.content === input.content;
+
         // 三路并发检索，构成 RAG 上下文：
         //   1. 用户长期偏好（来自搜索历史聚合的关键词/分类频次）
         //   2. 与本次输入相关的视频（最多 10 条）
@@ -189,7 +201,7 @@ export const appRouter = router({
           relevantActresses,
         };
 
-        // 组装 LLM 消息数组：system（人设 + RAG 上下文） → 历史消息 → 本轮用户输入。
+        // 组装 LLM 消息数组：system（人设 + RAG 上下文） → 历史消息（正序，已含本轮输入）。
         // buildChatSystemPrompt 会把 userContext 序列化进 system prompt，
         // 让模型只在给定的视频/女优候选集中做推荐。
         // Build messages for LLM with user context
@@ -198,14 +210,19 @@ export const appRouter = router({
             role: "system" as const,
             content: buildChatSystemPrompt(userLanguage, userContext),
           },
-          ...history.map(msg => ({
+          ...orderedHistory.map(msg => ({
             role: msg.role as "user" | "assistant",
             content: msg.content,
           })),
-          {
-            role: "user" as const,
-            content: input.content,
-          },
+          // 仅在历史里没拿到本轮消息时才补上，避免重复提问
+          ...(historyHasCurrentMessage
+            ? []
+            : [
+                {
+                  role: "user" as const,
+                  content: input.content,
+                },
+              ]),
         ];
 
         // Invoke Heretic LLM
@@ -498,8 +515,8 @@ export const appRouter = router({
               keywordMatch = Math.max(keywordMatch, matchCount / keywords.length);
             });
             
-            // 分类匹配：命中用户显式偏好分类记满分 1，命中"不想看"的分类记负分。
-            // ⚠️ 负分惩罚在下方传参时被 Math.max(categoryMatch, 0) 抹平，实际不生效（见 observations）。
+            // 分类匹配：命中用户显式偏好分类记满分 1，命中"不想看"的分类记负分（-0.5）。
+            // 负分会以 0.2 的权重折算成 -0.1 的最终分惩罚，使被排斥分类更难越过 0.2 的入选门槛。
             // Category matching score
             if (preferences?.preferredCategories?.includes(video.category || "")) {
               categoryMatch = 1;
@@ -521,7 +538,10 @@ export const appRouter = router({
             // Calculate final score using weighted factors
             const finalScore = calculateRecommendationScore(
               Math.min(keywordMatch, 1),
-              Math.max(categoryMatch, 0),
+              // 修复：原先写的是 Math.max(categoryMatch, 0)，会把 avoidedCategories 的
+              // -0.5 惩罚夹回 0，导致"不想看的分类"与"无关分类"完全等价、惩罚形同虚设。
+              // 现在按 [-0.5, 1] 夹取，保留负向惩罚（下限即上面赋的 -0.5，仅作防御性约束）。
+              Math.max(Math.min(categoryMatch, 1), -0.5),
               // 女优偏好因子权重 0.2，但需要 JOIN video_actresses 才能算，当前未接入，恒传 0；
               // 这意味着最终分的理论上限只有 0.8。
               0, // actress match would require additional data

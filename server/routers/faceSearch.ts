@@ -13,7 +13,7 @@
  *   |-----------------|----------|--------|------|
  *   | `searchByImage` | mutation | public | 上传人脸图片 → LLM 分析特征 → LLM 匹配女优 |
  *   | `searchByName`  | mutation | public | 按名字（英/日/中）模糊匹配女优 + 关联视频 |
- *   | `getHistory`    | query    | public | 读取某用户的检索历史 |
+ *   | `getHistory`    | query    | protected | 读取**当前登录用户自己**的检索历史 |
  *
  * ## 上下游依赖
  * - 上游调用方：`client/src/pages/FaceSearchPage.tsx`
@@ -35,7 +35,7 @@
  */
 
 import { z } from "zod";
-import { publicProcedure, router } from "../_core/trpc";
+import { publicProcedure, protectedProcedure, router } from "../_core/trpc";
 import { getDb } from "../db";
 import {
   actresses,
@@ -201,26 +201,39 @@ Match these actresses to the face analysis. Consider name associations, bio desc
 
         // Parse matching results
         // 同样用贪婪正则截取 JSON 数组（第一个 [ 到最后一个 ]）。
-        // 降级策略：解析抛错时不让整个请求失败，而是伪造一份「前 10 位女优 + 递减分数」的
-        // 兜底结果，保证 UI 至少有内容可展示。
+        // 降级策略：**只要没能从 LLM 响应中拿到可用的 JSON 数组**（无论是没匹配到
+        // `[...]`、解析抛错、还是解析出来不是数组），都不让整个请求失败，而是伪造一份
+        // 「前 10 位女优 + 递减分数」的兜底结果，保证 UI 至少有内容可展示。
         //   1 - i*0.08 → 1.00 / 0.92 / 0.84 ... 并用 max(0.5, ...) 兜底在 0.5，
         //   即兜底分数区间为 [0.5, 1.0]，视觉上仍像一份「可信」的排序。
-        let matchResults: Array<{ id: number; similarity: number; reason: string }> = [];
-        try {
-          const matchContent = matchingResponse.choices[0]?.message?.content;
-          if (typeof matchContent === "string") {
-            const jsonMatch = matchContent.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-              matchResults = JSON.parse(jsonMatch[0]);
-            }
-          }
-        } catch {
-          // Fallback: return all actresses with random similarity scores
-          matchResults = allActresses.slice(0, 10).map((a, i) => ({
+        // 注意：LLM 正常返回空数组 `[]`（确实没有 similarity > 0.3 的候选）时**不兜底**，
+        // 此时「未找到匹配」是真实结论。
+        const buildFallbackMatches = () =>
+          allActresses.slice(0, 10).map((a, i) => ({
             id: a.id,
             similarity: Math.max(0.5, 1 - i * 0.08),
             reason: "AI分析による推定マッチ",
           }));
+
+        let matchResults: Array<{ id: number; similarity: number; reason: string }> = [];
+        try {
+          const matchContent = matchingResponse.choices[0]?.message?.content;
+          const jsonMatch =
+            typeof matchContent === "string" ? matchContent.match(/\[[\s\S]*\]/) : null;
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            // 修复：解析结果不是数组时（LLM 把数组包在对象里等）也走兜底，
+            // 否则下游 matchResults.filter 会抛 TypeError
+            matchResults = Array.isArray(parsed) ? parsed : buildFallbackMatches();
+          } else {
+            // 修复：原实现把兜底写在 catch 里，只有 JSON.parse 抛错才生效；
+            // 而「LLM 返回的文本里根本不含 [...]」这一最常见的失败形态既不抛错也不兜底，
+            // matchResults 保持空数组直接返回，用户看到「マッチする女優が見つかりませんでした」。
+            matchResults = buildFallbackMatches();
+          }
+        } catch {
+          // Fallback: return top actresses with descending placeholder scores
+          matchResults = buildFallbackMatches();
         }
 
         // Build results with actress details
@@ -445,34 +458,34 @@ Match these actresses to the face analysis. Consider name associations, bio desc
 
   // Get search history
   /**
-   * 【public / query】读取指定用户的人脸/名字检索历史。
+   * 【protected / query】读取**当前登录用户自己**的人脸/名字检索历史。
    *
-   * ⚠️ 权限说明：这是 `publicProcedure` 且 userId 由客户端入参指定，
-   * 意味着任何调用方传入任意 userId 都能读到对方的检索历史（含上传图 URL）。
-   * 若要收紧，应改为 `protectedProcedure` 并从 `ctx.user.id` 取值。
+   * 权限说明：目标 userId 一律取自 `ctx.user.id`（由 session cookie 解析而来），
+   * **不接受客户端指定**。历史记录里含用户上传的人脸图 URL（uploadedImageUrl），
+   * 属于隐私数据，任何跨用户读取都必须被禁止。
    *
-   * @param input.userId 目标用户 id
    * @param input.limit  返回条数 1~50，默认 20
    * @returns `face_search_history` 原始行数组；**未指定排序**，MySQL 返回顺序不保证是「最新在前」
+   * @throws TRPCError UNAUTHORIZED — 未登录（由 protectedProcedure 中间件抛出）
    * @throws Error("Database not available") — DB 未初始化
    *         （其余查询异常被吞掉并返回空数组 `[]`，前端无法区分「无历史」与「查询失败」）
    */
-  getHistory: publicProcedure
+  getHistory: protectedProcedure
     .input(
       z.object({
-        userId: z.number().int().positive(),
         limit: z.number().int().min(1).max(50).default(20),
       })
     )
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
       try {
+        // 修复：越权读取他人隐私 —— userId 改为从 ctx.user 取，不再由客户端入参指定
         const history = await db
           .select()
           .from(faceSearchHistory)
-          .where(eq(faceSearchHistory.userId, input.userId))
+          .where(eq(faceSearchHistory.userId, ctx.user.id))
           .limit(input.limit);
 
         return history;

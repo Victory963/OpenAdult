@@ -28,18 +28,23 @@
  * 3. **全部包 try/catch**：LLM 与 DB 都可能不可用，失败时统一抛出带前缀的
  *    日文错误信息，前端直接展示给用户。
  *
- * ## ⚠️ 重大注意事项（当前实现的未完成状态）
- * `faceSearch` 的相似度目前是 **`Math.random()` 生成的伪造分数**，
- * LLM 提取到的面部特征（`faceAnalysis`）根本没有参与匹配，
- * actress_face_embeddings 表也未被读取。也就是说该接口返回的是随机结果。
- * 真正可用的女优检索实现在 `server/routers/faceSearch.ts`（`faceSearch` 命名空间）。
+ * ## ⚠️ 与 `server/routers/faceSearch.ts` 的关系
+ * 本文件的 `search.faceSearch` 走的是 **向量比对**路线：用 `extractFaceEmbedding`
+ * 把查询图转成 14 维伪向量，与 `actress_face_embeddings` 表中管理面板导入的底库向量
+ * 做余弦相似度比较。而 `faceSearch` 命名空间（`server/routers/faceSearch.ts`）走的是
+ * **LLM 语义匹配**路线（把女优的 bio/tags 清单塞进 prompt 让模型排序）。
+ * 两者互为补充：本路线要求底库已录入人脸图，命中更客观；那条路线无需底库但依赖文本质量。
  */
 import { protectedProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import { getDb, saveSearchHistory } from "./db";
-import { actresses, videos, videoActresses } from "../drizzle/schema";
+import { actresses, videos, videoActresses, actressFaceEmbeddings } from "../drizzle/schema";
 import { invokeLLM } from "./_core/llm";
-// 注：eq 在本文件中已无引用点（历史遗留），仅 inArray / desc 实际使用。
+import {
+  extractFaceEmbedding,
+  calculateCosineSimilarity,
+  parseEmbedding,
+} from "./_core/faceRecognition";
 import { eq, inArray, desc } from "drizzle-orm";
 
 /**
@@ -47,17 +52,26 @@ import { eq, inArray, desc } from "drizzle-orm";
  * アップロード画像から顔特徴を抽出し、女優の顔埋め込みと比較
  *
  * ---
- * 人脸检索 procedure：上传图片 → 找出长相相似的女优 → 返回她们的作品。
+ * 人脸检索 procedure：上传图片 → 抽取 14 维人脸伪向量 → 与 `actress_face_embeddings`
+ * 底库做余弦相似度比对 → 取 Top 10 女优 → 返回她们的作品。
+ *
+ * 前置条件：底库需先由管理面板导入女优人脸图
+ * （server/routers/actressManagement.ts 的 uploadActressFaceImage）。
+ * 底库为空时本接口只会返回空结果 —— 这是刻意的，返回无关女优比返回空更糟。
  *
  * @权限 protected（需登录；因为要写 search_history 且会消耗 LLM 额度）
  * @param input.imageUrl  待检索图片的**公开可访问 URL**（须先上传到 S3）。
- *                        zod 的 `.url()` 只校验格式，不校验可达性 —— 无效 URL 会在
- *                        LLM 网关侧拉取失败并冒泡成 500。
- * @param input.threshold 相似度下限，取值 0~1，默认 0.7。默认值偏高是为了
- *                        "宁缺毋滥"：人脸检索误报的体验代价远大于漏报。
+ *                        zod 的 `.url()` 只校验格式，不校验可达性 —— 无效 URL 会导致
+ *                        特征抽取失败，走"抽取不到人脸特征"的降级分支。
+ * @param input.threshold 余弦相似度下限，取值 0~1，默认 0.7。
+ *                        ⚠️ 伪向量的分量全为正，任意两向量的余弦相似度通常已 >0.9，
+ *                        因此 0.7 实际过滤力度很弱（见 server/_core/faceRecognition.ts 的说明），
+ *                        调参需以实测分布为准。
  * @returns 成功路径返回 `{ success, actresses, videos, message }`；
- *          无数据/无匹配的两条降级路径返回的字段并不一致（见 observations）。
- * @副作用 调用 LLM ×1（多模态视觉）；写库 ×1（search_history，searchType="face"）
+ *          特征抽取失败/底库为空/查库失败三条降级路径返回
+ *          `{ message, actresses: [], videos: [], analysis: {} }`（形状与成功路径不一致）。
+ * @副作用 调用 LLM ×1（多模态视觉，由 extractFaceEmbedding 发起）；
+ *         写库 ×1（search_history，searchType="face"；仅在走到打分之后的路径时写）
  * @throws `顔認識検索に失敗しました: <原因>` —— 任何环节异常都会被包装后重抛
  */
 export const faceSearch = protectedProcedure
@@ -74,49 +88,36 @@ export const faceSearch = protectedProcedure
 
       const userId = ctx.user!.id as number;
 
-      // 用 LLM 把人脸转成结构化特征描述（年龄段/发色/瞳色/肤色/脸型/显著特征）。
-      // system prompt 里强调 "Return ONLY valid JSON" 是为了避免模型加上
-      // "Here is the JSON:" 之类的前后缀，导致后续 JSON.parse 失败。
-      // `detail: "high"` 让网关按高分辨率送图 —— 面部细节在低分辨率下会丢失，
-      // 代价是 token 消耗显著上升。
+      // 修复：原实现先用 invokeLLM 取一段自由文本的面部描述，却在打分时把它整个丢弃，
+      //       改用 `Math.random()` 生成 0.5~1.0 的伪造相似度（同一张图每次结果都不同，
+      //       且与图片内容无关，那次 detail:"high" 的多模态调用纯属浪费）。
+      //       现改为使用与底库入库时**同一个**特征抽取器，走真实的余弦相似度比对。
       //
-      // ⚠️ 但请注意：下面的匹配逻辑**完全没有使用 faceAnalysis**，
-      // 这次 LLM 调用目前是纯粹的成本浪费（见文件头注意事项与 observations）。
+      // extractFaceEmbedding 把人脸转成 14 维伪向量（取值 0~1）。
+      // 管理面板导入女优人脸图时（server/routers/actressManagement.ts）用的也是这个函数，
+      // 两侧共用同一套特征定义，向量之间才具备可比性。
+      // 该函数全程吞异常：失败返回 null，因此这里必须显式判空。
       // Heretic LLMで顔特徴を抽出
-      const faceAnalysis = await invokeLLM({
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a facial recognition expert. Analyze the uploaded image and extract facial features in JSON format with: age_range, ethnicity, distinctive_features, hair_color, eye_color, skin_tone, face_shape. Return ONLY valid JSON.",
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Extract facial features from this image for recognition purposes.",
-              },
-              {
-                type: "image_url",
-                image_url: {
-                  url: input.imageUrl,
-                  detail: "high",
-                },
-              },
-            ],
-          },
-        ],
-      });
+      const queryEmbedding = await extractFaceEmbedding(input.imageUrl);
+      if (!queryEmbedding) {
+        console.warn("[Face Search] Failed to extract embedding from query image");
+        return {
+          message: "画像から顔特徴を抽出できませんでした",
+          actresses: [],
+          videos: [],
+          analysis: {},
+        };
+      }
 
+      // 读取女优人脸底库：actress_face_embeddings ⨝ actresses。
       // 只 SELECT 明确列出的列，而不是 `select().from(actresses)`：
-      // 生产库与 drizzle/schema.ts 可能存在版本偏移（例如 faceEmbedding 列尚未迁移上线），
+      // 生产库与 drizzle/schema.ts 可能存在版本偏移（例如某些列尚未迁移上线），
       // 全列查询会因"Unknown column"整体报错。显式列清单可以把爆炸半径限制住。
       // 女優データを取得（存在するカラムのみ選択）
-      let allActresses;
+      let embeddingRows;
       try {
         // 存在するカラムのみを選択
-        allActresses = await db
+        embeddingRows = await db
           .select({
             id: actresses.id,
             name: actresses.name,
@@ -124,8 +125,10 @@ export const faceSearch = protectedProcedure
             profileImageUrl: actresses.profileImageUrl,
             tags: actresses.tags,
             videoCount: actresses.videoCount,
+            embedding: actressFaceEmbeddings.embedding,
           })
-          .from(actresses);
+          .from(actressFaceEmbeddings)
+          .innerJoin(actresses, eq(actressFaceEmbeddings.actressId, actresses.id));
       } catch (dbError) {
         // 表不存在 / 列缺失时降级为"没有可检索的数据"，而不是抛 500。
         // 这样新环境在女优库尚未初始化时，页面仍能正常渲染出空结果。
@@ -133,17 +136,7 @@ export const faceSearch = protectedProcedure
         //    前端需要做兼容判断。
         console.error("[Face Search] Database error:", dbError);
         // テーブルが存在しない場合は空の結果を返す
-        console.warn("[Face Search] No actresses found or table error");
-        return {
-          message: "検索対象の女優データが見つかりません",
-          actresses: [],
-          videos: [],
-          analysis: {},
-        };
-      }
-      
-      if (!allActresses || allActresses.length === 0) {
-        console.warn("[Face Search] No actresses found in database");
+        console.warn("[Face Search] No face embeddings found or table error");
         return {
           message: "検索対象の女優データが見つかりません",
           actresses: [],
@@ -152,23 +145,45 @@ export const faceSearch = protectedProcedure
         };
       }
 
-      // ===== 相似度打分（当前为占位实现） =====
-      // ⚠️ 这里没有做任何真实比对：既没用上面 LLM 提取的 faceAnalysis，
-      //    也没读 actress_face_embeddings 表，而是给每个女优随机打 0.5~1.0 的分。
-      //    随机区间下界取 0.5 是为了让默认 threshold=0.7 仍能筛出一部分结果，
-      //    保证演示时页面不空白 —— 但这也意味着**同一张图每次搜索结果都不同**。
-      //    真实实现请参考 server/routers/faceSearch.ts。
+      // 底库为空（管理面板还没导入过任何女优人脸图）时同样降级为空结果。
+      // 注意这与「有底库但都不够相似」是两回事，文案上刻意区分开，
+      // 便于运营判断是"没录数据"还是"确实没匹配上"。
+      if (!embeddingRows || embeddingRows.length === 0) {
+        console.warn("[Face Search] No actress face embeddings in database");
+        return {
+          message: "検索対象の女優データが見つかりません",
+          actresses: [],
+          videos: [],
+          analysis: {},
+        };
+      }
+
+      // ===== 相似度打分（余弦相似度） =====
+      // 一位女优可以录入多张人脸图（底库里就是多行），取其中**最高分**作为她的相似度，
+      // 否则同一人会在结果里重复出现、并被低质量的那张图拉低排名。
+      // 单行向量损坏（embedding 列不是合法 JSON）时跳过该行而不是整体失败 ——
+      // 底库是批量导入的，个别脏数据不应让整次检索报错。
       // 顔特徴に基づいて女優をスコアリング
-      const scoredActresses = allActresses
-        .map((actress) => {
-          // ランダムスコアを生成（実際のfaceEmbeddingデータを使用しないため）
-          const score = Math.random() * 0.5 + 0.5; // 0.5 - 1.0
+      const bestByActress = new Map<
+        number,
+        Omit<(typeof embeddingRows)[number], "embedding"> & { similarity: number }
+      >();
+      for (const row of embeddingRows) {
+        const { embedding, ...actress } = row;
+        let similarity: number;
+        try {
+          similarity = calculateCosineSimilarity(queryEmbedding, parseEmbedding(embedding));
+        } catch {
+          console.warn(`[Face Search] Broken embedding for actress ${row.id}, skipped`);
+          continue;
+        }
+        const prev = bestByActress.get(row.id);
+        if (!prev || similarity > prev.similarity) {
+          bestByActress.set(row.id, { ...actress, similarity });
+        }
+      }
 
-          return {
-            ...actress,
-            similarity: score,
-          };
-        })
+      const scoredActresses = Array.from(bestByActress.values())
         // 先按阈值过滤 → 再降序 → 截断 Top 10。
         // 顺序不可调换：先 slice 再 filter 会丢掉本该入选的高分项。
         // 10 是人脸检索结果页一屏能展示的数量上限。

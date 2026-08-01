@@ -66,8 +66,8 @@ const isNonEmptyString = (value: unknown): value is string =>
  *
  * 刻意保持极简：
  * - `openId`：用户主键，后续据此查库；
- * - `appId`：签发方应用标识（当前 `verifySession` 只校验其非空，**未**比对 `ENV.appId`）；
- * - `name`：仅为免查库展示昵称而冗余，非权威数据。
+ * - `appId`：签发方应用标识（`verifySession` **不**校验它，也**未**比对 `ENV.appId`）；
+ * - `name`：仅为免查库展示昵称而冗余，非权威数据，允许为空串。
  *
  * **不含 `role`** —— 权限必须实时反映数据库，避免降权后旧 token 仍是管理员。
  */
@@ -329,9 +329,10 @@ class SDKServer {
   /**
    * 取 HS256 签名密钥（jose 要求 Uint8Array 形式的对称密钥）。
    *
-   * 注意：`ENV.cookieSecret` 未配置时是空字符串，编码后是零长度密钥 ——
-   * jose 仍会正常签发与验证，于是所有人都能用一个公开可推导的密钥伪造 session。
-   * 生产环境必须确保 `JWT_SECRET` 已设置（本文件不做校验）。
+   * 注意：`ENV.cookieSecret` 由 `env.ts` 的 `resolveCookieSecret()` 保证**非空**
+   * （`JWT_SECRET` 未配置时：生产环境启动即抛错，非生产环境退化为一次性随机密钥）。
+   * 这条保证是必要的 —— 空串会被编码成零长度密钥，jose 仍会照常签发与验证，
+   * 于是任何人都能用公开可推导的密钥伪造 session。
    *
    * 每次调用都重新编码一次，未做缓存；相对 JWT 签验本身开销可忽略。
    */
@@ -407,14 +408,16 @@ class SDKServer {
    * 通过把 header 改成 `alg: "none"` 或非对称算法来绕过验签（经典的 JWT alg 混淆攻击）。
    * `jwtVerify` 同时会自动校验 `exp` 是否过期。
    *
-   * 验签通过后仍要逐字段做非空字符串检查：JWT 只保证"没被篡改"，
-   * 不保证 payload 结构符合预期（例如旧版本签发的 token 可能缺 name 字段）。
+   * 验签通过后仍要做一次字段检查：JWT 只保证"没被篡改"，不保证 payload 结构符合预期
+   * （例如旧版本签发的 token 可能缺字段）。但**只有 `openId` 是必填**——它是唯一的鉴权依据；
+   * `appId` / `name` 缺失或非字符串时归一为 `""` 而不判为无效，以免与签发侧不对称（见函数体注释）。
    *
    * 注意：**未校验 `appId` 是否等于 `ENV.appId`**，因此同一个 `JWT_SECRET`
    * 下其他应用签发的 token 在本站同样有效。
    *
    * @param cookieValue cookie 中的 JWT 字符串，可为空
-   * @returns 校验通过返回 `{ openId, appId, name }`；任何失败（缺失/过期/篡改/字段缺失）**均返回 null 而不抛错**
+   * @returns 校验通过返回 `{ openId, appId, name }`（后两者可能是空串）；
+   *          任何失败（缺失/过期/篡改/缺 openId）**均返回 null 而不抛错**
    */
   async verifySession(
     cookieValue: string | undefined | null
@@ -432,21 +435,25 @@ class SDKServer {
       });
       const { openId, appId, name } = payload as Record<string, unknown>;
 
-      // 三个字段必须都是非空字符串。注意 name 也被强制要求非空，
-      // 意味着签发时 name 为 ""（用户未设置昵称）的 token 会在此被判为无效 —— 见 observations。
-      if (
-        !isNonEmptyString(openId) ||
-        !isNonEmptyString(appId) ||
-        !isNonEmptyString(name)
-      ) {
-        console.warn("[Auth] Session payload missing required fields");
+      // 修复：只有 openId 是鉴权依据，必须非空；appId / name 放宽为可选。
+      // 原实现要求三者都是非空字符串，与签发侧不对称，导致必然的登录死循环：
+      // - `createSessionToken` 用 `name: options.name || ""` 签发，OAuth 资料无昵称的用户
+      //   拿到的 token 100% 通不过自身校验（回调成功、cookie 已种，但每个请求都被判为匿名，
+      //   重复登录也无法解决）；
+      // - `appId` 取自 `ENV.appId`，`VITE_APP_ID` 未配置时同样是 ""，会让**所有**用户的
+      //   session 校验失败。
+      // 放宽二者不损失任何安全性：appId 从未与 `ENV.appId` 比对过（非受众校验，伪造者
+      //   自己填个非空值即可绕过），name 只是免查库展示用的冗余字段。
+      if (!isNonEmptyString(openId)) {
+        console.warn("[Auth] Session payload missing required field: openId");
         return null;
       }
 
       return {
         openId,
-        appId,
-        name,
+        // 缺失/非字符串统一归一为 ""，保持返回结构不变（调用方无需判类型）。
+        appId: typeof appId === "string" ? appId : "",
+        name: typeof name === "string" ? name : "",
       };
     } catch (error) {
       // 过期、签名不匹配、格式非法都会走到这里，统一降级为"未登录"。

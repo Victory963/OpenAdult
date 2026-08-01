@@ -36,7 +36,8 @@
  *    可以直接照抄。归一化在本文件内部完成，发出去的 payload 一律是 snake_case。
  * 2. **模型不可由调用方指定**：`payload.model` 恒为 `ENV.hereticLlmModel`。本站内容领域
  *    会触发通用对齐模型的安全拒答，因此全站锁死使用去对齐（abliterated）模型。
- * 3. **`maxTokens` 入参实际被忽略**（见 `invokeLLM` 内的注释）—— 已知坑，未修。
+ * 3. **`maxTokens` 未传时兜底为 32768**：调用方传入的 `maxTokens` / `max_tokens` 会被透传给上游，
+ *    两者都没传才用 32768（模型最大输出窗口）兜底。
  * 4. **无重试、无超时、无流式**：一次 `fetch` 定生死；非 2xx 直接抛 `Error`（注意是原生
  *    Error 而非 `TRPCError`，落到 tRPC 层会变成 INTERNAL_SERVER_ERROR）。调用方若需要
  *    容错，需自行 try/catch（`faceRecognition.ts` 就是这么做的）。
@@ -129,8 +130,8 @@ export type ToolChoice =
  * 成对出现的 camelCase / snake_case 字段是**同义别名**，两者都传时以 camelCase 优先
  * （见 `invokeLLM` 中的 `toolChoice || tool_choice` 等表达式）。
  *
- * 注意：`maxTokens` / `max_tokens` 虽然在类型上存在，但当前实现**不会**把它们透传给
- * 上游 —— payload 里的 max_tokens 被硬编码覆盖了。
+ * 注意：`maxTokens` / `max_tokens` 会被透传为 payload 的 `max_tokens`；两者都未传时
+ * 兜底为 32768。
  */
 export type InvokeParams = {
   messages: Message[];
@@ -431,6 +432,8 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     tools,
     toolChoice,
     tool_choice,
+    maxTokens,
+    max_tokens,
     outputSchema,
     output_schema,
     responseFormat,
@@ -457,14 +460,15 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   }
 
   // 魔法数字说明：
-  // - max_tokens = 32768（32K）：单次响应的输出上限，取本项目所用模型的最大输出窗口，
+  // - max_tokens 默认 32768（32K）：单次响应的输出上限，取本项目所用模型的最大输出窗口，
   //   意在避免长篇推荐/描述被中途截断（finish_reason = "length"）。
-  //   ⚠️ 注意：此处为**硬编码覆盖**，`InvokeParams.maxTokens` / `max_tokens` 被完全忽略，
-  //   调用方传入的值不会生效。
+  //   修复：改为透传调用方的 `maxTokens` / `max_tokens`（camelCase 优先），仅在两者都未传
+  //   时才用 32768 兜底。此前是硬编码覆盖，任何传值限制输出长度的调用点都会静默失效。
+  //   用 `??` 而非 `||`，以便调用方显式传 0 时也能原样发给上游而不被吞成默认值。
   // - thinking.budget_tokens = 128：思维链（reasoning）token 预算，刻意压到很低。
   //   本站的 LLM 用途（分类、打分、写标题）都是短判断型任务，不需要长推理；
   //   限制预算可显著降低延迟与成本，同时防止模型把 token 花在自我审查上。
-  payload.max_tokens = 32768
+  payload.max_tokens = maxTokens ?? max_tokens ?? 32768;
   payload.thinking = {
     "budget_tokens": 128
   }

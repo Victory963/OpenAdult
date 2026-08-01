@@ -46,6 +46,51 @@ import { getDb } from "../db";
 import { actressFaceEmbeddings, actresses } from "../../drizzle/schema";
 import { eq } from "drizzle-orm";
 import { extractFaceEmbedding, stringifyEmbedding } from "../_core/faceRecognition";
+import { TRPCError } from "@trpc/server";
+import { jwtVerify } from "jose";
+import { ENV } from "../_core/env";
+import { parse as parseCookieHeader } from "cookie";
+
+/** 管理员会话 cookie 名，必须与 `./admin-auth.ts`、`./ad-management.ts` 中的常量保持一致 */
+const ADMIN_COOKIE_NAME = "admin_session_id";
+/** JWT issuer 声明，校验时会比对；同样需与 `./admin-auth.ts` 一致 */
+const ADMIN_JWT_ISSUER = "openadult-admin";
+
+/**
+ * 派生管理员 JWT 的 HMAC 密钥（与 `./admin-auth.ts` 的 `getAdminJwtSecret()` 同构）。
+ *
+ * 在 `ENV.cookieSecret` 后拼 `"_admin"` 做域分离：管理员 token 与普通用户 session token
+ * 用不同密钥，拿到一种也无法伪造另一种。
+ */
+function getAdminJwtSecret() {
+  return new TextEncoder().encode(ENV.cookieSecret + "_admin");
+}
+
+/**
+ * 判断当前请求是否具备管理员身份 —— 兼容项目里**并行的两套授权体系**：
+ *   1. 管理面板的独立密码认证：`admin_session_id` cookie（由 `./admin-auth.ts` 签发）；
+ *   2. Manus OAuth 体系：`ctx.user.role === "admin"`（即 `adminProcedure` 的判定依据）。
+ * 任一成立即视为管理员，因此无论从管理面板还是从已登录的 admin 账号调用都不会被误拦。
+ *
+ * 实现与 `./ad-management.ts` 的 `verifyAdminFromCtx()` 一致（该函数未导出，故此处重写一份；
+ * 三处 cookie 名 / issuer / 密钥推导必须同步修改，否则会出现「登录成功但接口全部 403」）。
+ *
+ * @param ctx tRPC context；只用到 `ctx.req.headers.cookie` 与 `ctx.user`
+ * @returns 是管理员返回 true；缺 token、签名错、过期、issuer 不匹配且 OAuth 角色也不是 admin 时返回 false
+ */
+async function isAdminRequest(ctx: any): Promise<boolean> {
+  if (ctx?.user?.role === "admin") return true;
+
+  const cookies = parseCookieHeader(ctx?.req?.headers?.cookie || "");
+  const token = cookies[ADMIN_COOKIE_NAME];
+  if (!token) return false;
+  try {
+    await jwtVerify(token, getAdminJwtSecret(), { issuer: ADMIN_JWT_ISSUER });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const actressManagementRouter = router({
   /**

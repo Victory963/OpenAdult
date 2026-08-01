@@ -72,6 +72,8 @@ interface AdSegment {
   duration: number;
   /** 点击跳转落地页；null 表示不可点击 */
   clickUrl: string | null;
+  /** ads.priority，数值越大越优先；同一坑位有多条候选时用它挑选。DB 中为 null 时归一为 0 */
+  priority: number;
 }
 
 /**
@@ -241,6 +243,8 @@ async function getAdsForVideo(
       videoUrl: ad.videoUrl,
       duration: ad.duration,
       clickUrl: ad.clickUrl,
+      // 修复：带上 priority，供下面「每坑位限 1 条」时按优先级挑选（列可空，null 归一为 0）
+      priority: ad.priority ?? 0,
     };
 
     if (placement.position === "pre-roll") {

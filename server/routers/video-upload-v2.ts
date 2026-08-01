@@ -28,7 +28,8 @@
  *                                                 │
  *                                          cancelUpload ──▶ 删除 chunks + session 行
  *
- *   注：schema 里定义的 `failed` 状态在本文件中**从未被写入**（失败路径只抛错，不改状态）。
+ *   注：`failed` 状态目前只在 completeUpload 合并分片下载失败时写入；其余异常路径
+ *   （LLM/S3/DB 报错）仍只抛错、不改状态，会话会停留在 "processing"。
  *
  * 【上下游依赖】
  * - 上游调用方：`client/src/components/VideoUploadForm.tsx`
@@ -61,7 +62,7 @@ import { getDb } from "../db";
 import { videos, videoActresses, videoUploadSessions, videoUploadChunks } from "../../drizzle/schema";
 import { storagePut, storageGet } from "../storage";
 import { invokeLLM } from "../_core/llm";
-// `and` 目前亦未被使用，仅 `eq` / `sql` 有实际调用。
+// `and` 用于 uploadChunk 中按 (sessionId, chunkIndex) 定位并覆盖重传的分片行。
 import { eq, and, sql } from "drizzle-orm";
 import path from "path";
 import crypto from "crypto";
@@ -189,11 +190,10 @@ export const videoUploadV2Router = router({
    *   3) 写库：回写 `video_upload_sessions.uploadedChunks` / `uploadedChunkIds`
    *
    * ⚠️ 与 `POST /api/upload/chunk`（server/_core/fastUpload.ts）的差异：
-   *   - 那条二进制通道用 `onDuplicateKeyUpdate` 处理重试去重，并用 `COUNT(*)` 重算进度
-   *     （并发安全），但**不维护 `uploadedChunkIds`**；
-   *   - 本 procedure 反之：维护 `uploadedChunkIds`，但用「读-改-写」方式累加，
-   *     并发上传时存在 lost update；重复上传同一 index 也会重复追加。
-   *   两条路径混用会让 `getMissingChunks`（依赖 uploadedChunkIds）给出错误结论。
+   *   - 那条二进制通道同样按分片实表 `COUNT(*)` 重算进度，但**不维护 `uploadedChunkIds`**；
+   *   - 本 procedure 除计数外还会刷新 `uploadedChunkIds`。
+   *   两者都以 `video_upload_chunks` 表为事实来源，混用不会导致进度/续传判断出错
+   *   （`getProgress` 与 `getMissingChunks` 也都直接读该表）。
    *
    * @param input.sessionId  会话句柄
    * @param input.chunkIndex 分片下标（从 0 开始）
@@ -257,6 +257,20 @@ export const videoUploadV2Router = router({
 
         // Save chunk metadata
         // 只存「指针 + 元信息」，分片内容留在 S3 —— 这是 V2 不再吃内存的关键。
+        // 修复：改为「先删同 (sessionId, chunkIndex) 的旧行再插入」的应用层 upsert。
+        // 原来是裸 INSERT，客户端重试同一分片会插入重复行，使 completeUpload 的
+        // COUNT(*) 虚高（分片明明齐了却被判为数量不符）。
+        // 这里没有用 `onDuplicateKeyUpdate`，是因为 `(sessionId, chunkIndex)` 上
+        // **没有唯一索引**（见 drizzle/schema.ts 注释），ON DUPLICATE KEY 不会触发；
+        // 补唯一索引需要配套迁移与线上去重，属于 schema 变更，故此处走应用层去重。
+        await db
+          .delete(videoUploadChunks)
+          .where(
+            and(
+              eq(videoUploadChunks.sessionId, input.sessionId),
+              eq(videoUploadChunks.chunkIndex, input.chunkIndex)
+            )
+          );
         await db.insert(videoUploadChunks).values({
           sessionId: input.sessionId,
           chunkIndex: input.chunkIndex,
@@ -266,15 +280,20 @@ export const videoUploadV2Router = router({
         });
 
         // Update session
-        // 读-改-写维护「已上传下标数组」：反序列化 → push 当前下标 → 再序列化写回。
-        // 该数组是 getMissingChunks 判定缺口的唯一依据（因此续传能力依赖它的正确性）。
-        // 【并发隐患】读与写之间没有加锁 / 没有走 SQL 原子更新，多个分片并发调用本
-        // procedure 时后写覆盖先写，会丢下标；同一下标重试还会被重复 push，
-        // 导致 uploadedChunks 计数虚高（可能 > totalChunks，使 progress 超过 100）。
-        const uploadedChunkIds = sessionData.uploadedChunkIds
-          ? JSON.parse(sessionData.uploadedChunkIds as string)
-          : [];
-        uploadedChunkIds.push(input.chunkIndex);
+        // 修复：原来用「读 sessionData.uploadedChunkIds → JSON.parse → push → 写回」的
+        // 读-改-写方式维护已传下标，并发上传时后写覆盖先写会丢下标、同一下标重试会被
+        // 重复 push（uploadedChunks 虚高、progress 可能超过 100）。
+        // 现改为从 `video_upload_chunks` 实表**重算**（去重 + 升序），与
+        // server/_core/fastUpload.ts 的 COUNT(*) 重算思路一致：无论并发多少、重传几次，
+        // 结果都收敛到事实值。同时把 uploadedChunkIds 也一并刷新，
+        // 使 getMissingChunks / getProgress 两条读路径看到一致的数据。
+        const chunkRows = await db
+          .select({ chunkIndex: videoUploadChunks.chunkIndex })
+          .from(videoUploadChunks)
+          .where(eq(videoUploadChunks.sessionId, input.sessionId));
+        const uploadedChunkIds = Array.from(new Set(chunkRows.map((c) => c.chunkIndex))).sort(
+          (a, b) => a - b
+        );
 
         await db
           .update(videoUploadSessions)
@@ -315,7 +334,7 @@ export const videoUploadV2Router = router({
    *   1) 写库：session.status = "processing"
    *   2) 调 LLM：由文件名推断 title/description/category（可降级）
    *   3) 写 S3：封面 `thumbnails/<userId>/<ts>-thumb.jpg`（若客户端提供了 thumbnailData）
-   *   4) 读 S3：逐个下载全部分片
+   *   4) 读 S3：逐个下载全部分片（任一分片失败 → session.status = "failed" 并抛错）
    *   5) 写 S3：合并后的完整视频 `videos/<userId>/<sessionId>.<ext>`
    *   6) 写库：`videos` 表 INSERT 一行
    *   7) 写库：session.status = "completed"，metadata 覆盖为 LLM 结果
@@ -509,23 +528,38 @@ export const videoUploadV2Router = router({
         // 串行逐个把分片从 S3 拉回内存。串行而非并发，是为了压住内存峰值与出网带宽，
         // 代价是大文件下这里会非常慢（N 个分片 × 一次 presigned URL + 一次 GET）。
         // storageGet 只返回带签名的下载 URL，真正取数据靠 fetch。
+        // 修复：分片下载失败必须中断整个合并流程。此前失败只记日志、继续循环，
+        // 缺失的分片会被静默跳过，Buffer.concat 仍照常执行，结果是**缺字节的损坏视频**
+        // 被上传并写入 videos 表，会话还被置为 completed（前端看到「上传成功」）。
+        // 现在改为：任一分片下载失败 → 把会话置为 "failed"（schema 已有该枚举值）→ 抛错，
+        // 客户端能明确感知失败并重新发起上传，而不是拿到一个坏文件。
         const chunkBuffers: Buffer[] = [];
         for (const chunk of chunks) {
           try {
             const { url: chunkUrl } = await storageGet(chunk.storageKey);
             const resp = await fetch(chunkUrl);
-            if (resp.ok) {
-              const arrayBuffer = await resp.arrayBuffer();
-              chunkBuffers.push(Buffer.from(arrayBuffer));
-            } else {
-              // 【严重隐患】下载失败只记日志、不中断也不补偿：该分片会被静默跳过，
-              // 后面 Buffer.concat 依然照常执行，结果是**缺字节的损坏视频**被当作
-              // 成功上传写入 videos 表。这里本应抛错并把 session 置为 "failed"。
-              console.error(`[Video Upload V2] Failed to download chunk ${chunk.chunkIndex}: ${resp.status}`);
+            if (!resp.ok) {
+              throw new Error(`HTTP ${resp.status}`);
             }
+            const arrayBuffer = await resp.arrayBuffer();
+            chunkBuffers.push(Buffer.from(arrayBuffer));
           } catch (e) {
-            // 同上：网络异常同样被吞掉，只留日志。
             console.error(`[Video Upload V2] Error downloading chunk ${chunk.chunkIndex}:`, e);
+            // 标记会话为终态 failed：外层 catch 只会把错误收敛成 500，不会改状态，
+            // 所以必须在这里落状态，否则会话永远卡在 "processing"。
+            // 该 UPDATE 本身失败也不能掩盖原始错误，故单独 try/catch 吞掉。
+            try {
+              await db
+                .update(videoUploadSessions)
+                .set({ status: "failed" })
+                .where(eq(videoUploadSessions.id, input.sessionId));
+            } catch (statusError) {
+              console.error("[Video Upload V2] Error marking session as failed:", statusError);
+            }
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: `Failed to download chunk ${chunk.chunkIndex}. Upload marked as failed, please retry.`,
+            });
           }
         }
 
@@ -603,10 +637,14 @@ export const videoUploadV2Router = router({
         };
       } catch (error: any) {
         console.error("[Video Upload V2] Error completing upload:", error);
-        // 透传语义化错误码，其余一律收敛为 500 且只回通用文案（防泄漏内部细节）。
-        // 【注意】进入本分支时会话状态仍停留在 "processing"，既不会回退到 "uploading"
-        // 也不会置为 "failed"，客户端轮询会看到一个永久卡在处理中的会话。
-        if (error.code === "BAD_REQUEST" || error.code === "FORBIDDEN") throw error;
+        // 透传本 handler 主动抛出的语义化 TRPCError（BAD_REQUEST / FORBIDDEN /
+        // 分片下载失败时的 INTERNAL_SERVER_ERROR），其余一律收敛为 500 且只回通用文案
+        // （防止把 S3/SQL 内部细节泄漏给客户端）。
+        // 修复：改用 `instanceof TRPCError` 判定，使分片合并失败时那条「已标记 failed，
+        // 请重试」的具体提示不再被覆盖成通用文案（原来只放行 BAD_REQUEST/FORBIDDEN）。
+        // 【注意】除分片下载失败外的其它异常路径，会话状态仍停留在 "processing"，
+        // 客户端轮询会看到一个卡在处理中的会话。
+        if (error instanceof TRPCError) throw error;
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: "Failed to complete upload",
@@ -766,12 +804,10 @@ export const videoUploadV2Router = router({
    *          `canResume` 语义是「还有缺口可补传」，即 missingChunks 非空；
    *          全部传完时它为 false（此时客户端该做的是调 completeUpload）。
    *
-   * ⚠️【与实际上传通道不一致】本 procedure 的缺口判定依赖会话行上的
-   *   `uploadedChunkIds` JSON 列，而生产路径 `POST /api/upload/chunk`
-   *   （server/_core/fastUpload.ts）只更新 `uploadedChunks` 计数与 chunks 表，
-   *   **从不写 uploadedChunkIds**。因此走二进制通道上传后调用本接口，会把所有
-   *   下标都报成缺失。`getProgress` 返回的 `uploadedChunkIndices`（取自 chunks 实表）
-   *   才是可靠的续传依据。
+   * 缺口判定以 `video_upload_chunks` 实表为准（tRPC 与二进制两条上传通道都会写该表），
+   * 因此不论客户端走哪条通道上传，本接口给出的 missingChunks 都是可靠的。
+   * 返回的 `uploadedChunks` 同样取自该表，可能与会话行上的 `uploadedChunks`
+   * 计数列存在短暂差异——以本接口的值为准。
    *
    * @throws TRPCError FORBIDDEN             非 admin
    * @throws TRPCError BAD_REQUEST           会话不存在
@@ -810,16 +846,26 @@ export const videoUploadV2Router = router({
         }
 
         const sessionData = session[0];
-        const uploadedChunkIds = sessionData.uploadedChunkIds
-          ? JSON.parse(sessionData.uploadedChunkIds as string)
-          : [];
+
+        // 修复：缺口判定改为以 `video_upload_chunks` 实表为准，不再读会话行上的
+        // `uploadedChunkIds` JSON 列。原因：生产路径 `POST /api/upload/chunk`
+        //（server/_core/fastUpload.ts，前端 VideoUploadForm.tsx 实际走的通道）
+        // 只写分片表与 uploadedChunks 计数，**从不写 uploadedChunkIds**，
+        // 因此走二进制通道上传后调用本接口会把 0..totalChunks-1 全部报成缺失，
+        // 断点续传彻底失效。分片实表是两条上传通道共同写入的唯一可靠来源
+        //（getProgress 的 uploadedChunkIndices 也取自这里）。
+        const chunkRows = await db
+          .select({ chunkIndex: videoUploadChunks.chunkIndex })
+          .from(videoUploadChunks)
+          .where(eq(videoUploadChunks.sessionId, input.sessionId));
+        // 用 Set 去重 + O(1) 查找：分片表在没有唯一索引的情况下可能存在重复行，
+        // 去重后 size 才等于「真实已传分片数」。
+        const uploadedChunkIds = new Set(chunkRows.map((c) => c.chunkIndex));
 
         // 全量补集扫描：遍历 0..totalChunks-1，凡不在已传集合中的即为缺口。
-        // 复杂度 O(totalChunks × 已传数)（`includes` 是线性查找）；分片数上万时
-        // 应改用 Set。这里选择线性数组是因为 uploadedChunkIds 本身就以 JSON 数组存库。
         const missingChunks: number[] = [];
         for (let i = 0; i < sessionData.totalChunks; i++) {
-          if (!uploadedChunkIds.includes(i)) {
+          if (!uploadedChunkIds.has(i)) {
             missingChunks.push(i);
           }
         }
@@ -827,7 +873,9 @@ export const videoUploadV2Router = router({
         return {
           sessionId: input.sessionId,
           totalChunks: sessionData.totalChunks,
-          uploadedChunks: sessionData.uploadedChunks,
+          // 同样取自分片实表（而非可能过期的 session.uploadedChunks 计数列），
+          // 保证 uploadedChunks 与 missingChunks 出自同一份事实数据。
+          uploadedChunks: uploadedChunkIds.size,
           missingChunks,
           canResume: missingChunks.length > 0,
         };

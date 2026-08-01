@@ -18,6 +18,7 @@
  *    避免 V1 那种 undefined 字段被一并写进 SET 子句的隐患。
  * 5. **封面兜底**：`create` 未提供 thumbnailUrl 时调用 `generatePlaceholderThumbnail()`
  *    生成占位图路由（`/api/video-thumbnail/:id`），保证列表页不出现破图。
+ *    该 URL 需要真实自增 ID，因此是在插入拿到 ID 之后再 UPDATE 补写的。
  *
  * ## 主要导出
  * - `videosV2Router` —— 6 个 procedure：
@@ -34,8 +35,8 @@
  *         `../_core/videoThumbnail` 的 `generatePlaceholderThumbnail()`。
  *
  * ## 关键设计决策 / 坑
- * - **`create` 用「插入后按 title 回查」拿新 ID**，而非读驱动返回的 insertId。
- *   这在同名视频并发创建时可能取到别人的行（详见该处注释与 observations）。
+ * - **`create` 用 Drizzle 的 `$returningId()` 拿新 ID**（曾经是「插入后按 title 倒序回查」，
+ *   同名视频并发创建时会取到别人的行，已修复）。
  * - **`list` 的 N+1 查询**：每条视频单独查一次女优（`Promise.all` 并发，但仍是 N 次往返）。
  *   V1 用的是「批量 IN 查询 + 内存装配」，在这一点上反而更优。
  * - **散落的 `as any`**：Drizzle 的链式查询构建器在 `.where()` / `.innerJoin()` 后类型会收窄，
@@ -62,9 +63,10 @@ export const videosV2Router = router({
    * @param input.category     分类名，可选。
    * @param input.duration     时长（秒），正整数，可选，缺省落库为 0。
    * @param input.actressIds   女优 ID 数组，可选；一次性批量 INSERT。
-   * @returns `{ success: true, message, videoId }`
-   * @副作用 写库：videos 插入 1 行 + video_actresses 批量插入 N 行（**无事务**）。
-   * @throws "Failed to create video" —— 插入后回查不到刚建的行。
+   * @returns `{ success: true, message, videoId }` —— videoId 取自 `$returningId()`，
+   *          即驱动返回的真实自增主键。
+   * @副作用 写库：videos 插入 1 行（未传封面时再 UPDATE 1 次写占位图）
+   *         + video_actresses 批量插入 N 行（**无事务**）。
    * @throws "Database not available"；其余数据库异常原样上抛（已记日志）。
    */
   // Create video
@@ -85,40 +87,43 @@ export const videosV2Router = router({
       if (!db) throw new Error("Database not available");
 
       try {
-        // 封面兜底：未传 thumbnailUrl 时生成占位图路由，避免列表页出现破图。
-        // 注意第一个参数传的是 0 而不是真实 videoId —— 此刻行还没插入，ID 尚不存在。
-        // generatePlaceholderThumbnail 返回 `/api/video-thumbnail/{id}?title=...`，
-        // 因此所有自动生成封面的视频都会指向 id=0 这个路径（见 observations）。
         // duration 缺省写 0 而非留 NULL，保证前端时长格式化不必处理 null 分支。
+        // 修复：不再在这里写占位封面。占位图 URL 形如 `/api/video-thumbnail/{id}`，
+        // 需要真实的自增 ID，而此刻行还没插入 —— 原代码硬传 0，导致所有自动生成封面的
+        // 视频 thumbnailUrl 全都指向 `/api/video-thumbnail/0`，彼此无法区分。
+        // 正确做法是插入拿到 ID 后再补写（见下方）。
         // Create video
-        await db.insert(videos).values({
-          title: input.title,
-          description: input.description,
-          videoUrl: input.videoUrl,
-          thumbnailUrl: input.thumbnailUrl || generatePlaceholderThumbnail(0, input.title),
-          category: input.category,
-          duration: input.duration || 0,
-        });
+        const inserted = await db
+          .insert(videos)
+          .values({
+            title: input.title,
+            description: input.description,
+            videoUrl: input.videoUrl,
+            thumbnailUrl: input.thumbnailUrl,
+            category: input.category,
+            duration: input.duration || 0,
+          })
+          .$returningId();
 
-        // ===== 回查刚插入的行以获取自增 ID =====
-        // 策略：按 title 精确匹配 + createdAt 降序取第一条。
-        // 这么写是因为 Drizzle 的 MySQL insert 返回类型没有暴露 insertId
-        // （V1 用 `(result as any).insertId` 硬取，其实更准确）。
-        // ⚠️ 已知竞态：同标题视频并发创建时，可能回查到**别人刚插入的那一行**，
-        //    进而把女优关联挂错视频；createdAt 只精确到秒也会加剧这个问题。
-        // Get created video
-        const created = await db
-          .select()
-          .from(videos)
-          .where(eq(videos.title, input.title))
-          .orderBy(desc(videos.createdAt))
-          .limit(1);
+        // ===== 取刚插入行的自增 ID =====
+        // 修复：原实现是「按 title 精确匹配 + createdAt DESC LIMIT 1」回查，
+        // 同标题视频并发创建时会取到别人刚插入的那一行（createdAt 只精确到秒会放大窗口），
+        // 进而把女优关联挂到错误的视频上。
+        // 改用 Drizzle 的 `$returningId()`：它直接基于驱动返回的 insertId + 自增主键
+        // 还原出 `[{ id: number }]`，无竞态。
+        // （注意不能照抄 V1 曾经的 `(result as any).insertId`——drizzle-orm/mysql2 的
+        //   INSERT 结果是数组 `[ResultSetHeader, FieldPacket[]]`，那样取恒为 undefined。）
+        // Get created video id
+        const videoId = inserted[0].id;
 
-        if (created.length === 0) {
-          throw new Error("Failed to create video");
+        // 封面兜底：未传 thumbnailUrl 时用真实 videoId 生成占位图路由，避免列表页破图。
+        // 这是插入后的第二条语句（同样没有事务保护）：万一失败，视频仍在，只是没有封面。
+        if (!input.thumbnailUrl) {
+          await db
+            .update(videos)
+            .set({ thumbnailUrl: generatePlaceholderThumbnail(videoId, input.title) })
+            .where(eq(videos.id, videoId));
         }
-
-        const videoId = created[0].id;
 
         // 批量 INSERT（单条 SQL 多组 VALUES），比 V1 的循环逐条插入少 N-1 次往返。
         // 外层的 length > 0 判断是必需的：Drizzle 对空 values 数组会生成非法 SQL。
@@ -339,8 +344,6 @@ export const videosV2Router = router({
         // `description: ""` 这类合法的"清零/清空"操作会被吞掉。
         // （对比 V1：V1 把 `input.xxx` 原样塞进 .set()，靠 Drizzle 的 mapUpdateSet
         //  自动剔除 undefined，最终效果相同，只是意图不如这里显式。）
-        // ⚠️ 缺一个空对象守卫：所有元数据字段都不传（只想改女优关联）时 updateData 为 {}，
-        //    Drizzle 的 mapUpdateSet 会抛 `Error("No values to set")` —— 见 observations。
         // Build update object
         const updateData: any = {};
         if (input.title !== undefined) updateData.title = input.title;
@@ -350,10 +353,15 @@ export const videosV2Router = router({
         if (input.category !== undefined) updateData.category = input.category;
         if (input.duration !== undefined) updateData.duration = input.duration;
 
-        await db
-          .update(videos)
-          .set(updateData)
-          .where(eq(videos.id, input.id));
+        // 修复：补上空对象守卫。所有元数据字段都不传（只想改女优关联）时 updateData 为 {}，
+        // Drizzle 的 mapUpdateSet 剔除 undefined 后 entries 为空会抛
+        // `Error("No values to set")`，导致下面的女优关联更新根本执行不到。
+        if (Object.keys(updateData).length > 0) {
+          await db
+            .update(videos)
+            .set(updateData)
+            .where(eq(videos.id, input.id));
+        }
 
         // ===== 女优关联「全量替换」=====
         // 用 `!== undefined` 精确区分三种意图（V1 用的是 truthy 判断，语义较模糊）：

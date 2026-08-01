@@ -17,7 +17,7 @@
  *
  * ## 主要导出
  * - `actressManagementRouter` —— 4 个 procedure：
- *   - `uploadActressFaceImage`      （public⚠️）从图片提取人脸特征并 upsert 到底库
+ *   - `uploadActressFaceImage`      （public 声明 + handler 内 admin 校验）从图片提取人脸特征并 upsert 到底库
  *   - `getActressesWithEmbeddings`  （protected）列出已建库的女优（带姓名）
  *   - `getActressById`              （protected）按 ID 读女优档案
  *   - `deleteActressFaceEmbedding`  （protected + 手写 admin 检查）删除一条特征记录
@@ -33,10 +33,12 @@
  *    因此项目改用 **LLM 视觉分析**给出十余项面部特征打分（脸型/眼型/肤色/发长…），
  *    再把这些分数当作伪向量存起来做相似度比较。详见 `server/_core/faceRecognition.ts`。
  *    → 直接后果：`uploadActressFaceImage` 每次调用都会**产生一次 LLM 费用与秒级延迟**。
- * 2. **`uploadActressFaceImage` 故意声明为 `publicProcedure`**（文件内已有英文注释说明）：
+ * 2. **`uploadActressFaceImage` 声明为 `publicProcedure` 但在 handler 内自行鉴权**：
  *    管理面板走的是 `./admin-auth.ts` 的独立 admin-cookie 认证，与 OAuth 的 `ctx.user` 不互通，
- *    所以这里没法用 `protectedProcedure`。**代价是该写接口对公网完全开放**，任何人都能
- *    改写任意女优的人脸底库并触发 LLM 调用（见 observations，属安全隐患）。
+ *    所以这里没法用 `protectedProcedure` / `adminProcedure` 中间件。
+ *    修复：改为在 handler 第一行调用本文件的 `isAdminRequest(ctx)`（两套授权体系任一通过即可），
+ *    与 `./ad-management.ts` 的 `verifyAdminFromCtx()` 用法一致 —— 中间件层放行、业务层拦截，
+ *    匿名请求会拿到 `TRPCError FORBIDDEN`，不会再触发 LLM 调用或写库。
  * 3. **每位女优只保留一条 embedding**：靠"先查后写"实现 upsert 语义，而非数据库唯一约束
  *    （`actress_face_embeddings` 表上没有 unique index），并发上传时可能插出重复行。
  */
@@ -99,21 +101,24 @@ export const actressManagementRouter = router({
    * 这是「以图搜女优」功能的**建库入口**：只有在这里录入过 embedding 的女优，
    * 才可能出现在 `faceSearch` 的检索结果中。
    *
-   * @权限 public ⚠️ —— 见文件头第 2 条：管理面板用独立 admin-cookie 认证，
-   *       OAuth 的 `ctx.user` 在管理面板里为空，故无法用 protectedProcedure。
-   *       这意味着**本接口对公网开放**，是已知的安全缺口。
+   * @权限 admin —— procedure 本身声明为 `publicProcedure`（因为管理面板用独立 admin-cookie
+   *       认证、OAuth 的 `ctx.user` 在管理面板里为空，用不了 protectedProcedure/adminProcedure
+   *       中间件），管理员判断改为在 handler 内用 `isAdminRequest(ctx)` 手写完成：
+   *       admin-cookie 与 OAuth admin 角色**任一成立**即放行。**勿删那段检查**。
    * @param input.actressId   目标女优 ID，正整数；必须已存在于 actresses 表。
    * @param input.imageUrl    人脸图片 URL（通常是刚上传到 S3 后拿到的可访问地址）。
    * @param input.actressName 可选，仅为调用方便利，**当前实现完全未使用**。
    * @returns `{ success: true, message, actressId, actressName }`
    *          —— 返回的 actressName 取自数据库中的档案，不是入参。
    * @副作用 **调用 LLM ×1**（视觉分析，耗时秒级且产生费用）+ 写库 1 行（UPDATE 或 INSERT）。
+   * @throws TRPCError FORBIDDEN —— 非管理员调用（在任何 LLM 调用与写库之前就被拦下）。
    * @throws "No face detected in image" —— LLM 未能识别出人脸（extractFaceEmbedding 返回 null）。
    * @throws "Actress not found" —— actressId 在 actresses 表中不存在。
    * @throws "Database not available"
    */
   // Upload actress face image and extract embedding
   // Using publicProcedure because admin panel uses separate admin-cookie auth
+  // （鉴权不靠中间件，而是在 mutation 体内调 isAdminRequest —— 见下方「修复」注释）
   uploadActressFaceImage: publicProcedure
     .input(
       z.object({
@@ -123,6 +128,18 @@ export const actressManagementRouter = router({
       })
     )
     .mutation(async ({ input, ctx }) => {
+      // 修复：本 procedure 原为纯 publicProcedure 且 handler 内无任何鉴权，
+      // 导致匿名访客可任意覆盖人脸底库（污染 faceSearch 排序）并无限触发计费的 LLM 调用。
+      // 现在改为手写管理员校验，用法与 ./ad-management.ts 的 verifyAdminFromCtx() 一致。
+      // ⚠️ 必须放在函数最前面 —— 早于 getDb() / extractFaceEmbedding()，
+      //    否则未授权请求仍会白白消耗数据库连接与 LLM 费用。删掉即等于把写库权限还给公网。
+      if (!(await isAdminRequest(ctx))) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "Admin authentication required",
+        });
+      }
+
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
@@ -214,8 +231,8 @@ export const actressManagementRouter = router({
   /**
    * 列出已建立人脸特征的女优（管理面板的「人脸底库」列表）。
    *
-   * @权限 protected —— 需登录。⚠️ 与写入接口 `uploadActressFaceImage`（public）
-   *       权限不一致：能读的人反而受限、能写的人不受限，这是历史遗留的错配。
+   * @权限 protected —— 需登录即可读；写入接口 `uploadActressFaceImage` 现已收紧到 admin，
+   *       读宽写严，不再是此前「能读的人受限、能写的人不受限」的错配。
    * @param input.limit 返回条数，1~100，默认 50。
    * @returns 数组，每项 `{ id, actressId, actressName, faceImageUrl, createdAt }`。
    *          `id` 是 embedding 记录主键（删除时要传的就是它，不是 actressId）；

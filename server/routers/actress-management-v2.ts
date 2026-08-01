@@ -34,8 +34,8 @@
  *    但读操作是 `protectedProcedure`，而管理面板走的是独立 admin-cookie 认证、
  *    OAuth 的 `ctx.user` 为空 —— 因此这套接口在管理面板中能否调通取决于登录方式，
  *    这是 V1/V2 与 admin-auth 三套认证并存造成的长期混乱点。
- * 2. **`create` 用「插入后按 name 回查」拿新 ID**，与 `videos-v2.ts` 同款竞态问题
- *    （同名女优并发创建会取错行）。
+ * 2. **`create` 用 Drizzle 的 `$returningId()` 拿新 ID**（曾经是「插入后按 name 倒序回查」，
+ *    与 `videos-v2.ts` 同款竞态：同名女优并发创建会取错行，已修复）。
  * 3. **`searchByName` 在内存里过滤全表**，与 `server/routers.ts` 的 `actresses.search`
  *    实现思路一致：三个名字字段（后两者可空）用 SQL LIKE 拼 OR 既无索引又难维护。
  *    规模上限明确，女优表变大后须改全文索引。
@@ -44,7 +44,8 @@
 import { protectedProcedure, router, adminProcedure } from "../_core/trpc";
 import { getDb } from "../db";
 import { actresses, videoActresses, actressFaceEmbeddings } from "../../drizzle/schema";
-import { eq, inArray, desc as descOrder, sql } from "drizzle-orm";
+// 修复：`desc as descOrder` 随 create 的回查一并删除（改用 $returningId() 后不再需要排序）。
+import { eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 
 export const actressManagementV2Router = router({
@@ -62,7 +63,7 @@ export const actressManagementV2Router = router({
    * @param input.tags            标签数组，可选，缺省写入空数组 `[]` 而非 NULL，
    *                              保证前端可以直接 `.map()` 而不必判空。
    * @returns `{ success: true, message, actressId }`
-   *          —— `actressId` 可能为 `undefined`（回查落空时，见下方注释）。
+   *          —— `actressId` 取自 `$returningId()`，即驱动返回的真实自增主键（不会为 undefined）。
    * @副作用 写库：actresses 插入 1 行。不建立人脸 embedding（那是 V1 路由的职责）。
    * @throws "Database not available"；其余数据库异常原样上抛（已记日志）。
    */
@@ -84,38 +85,37 @@ export const actressManagementV2Router = router({
       if (!db) throw new Error("Database not available");
 
       try {
-        await db.insert(actresses).values({
-          name: input.name,
-          japaneseName: input.japaneseName,
-          chineseName: input.chineseName,
-          bio: input.bio,
-          profileImageUrl: input.profileImageUrl,
-          birthDate: input.birthDate,
-          tags: input.tags || [],
-        });
+        const inserted = await db
+          .insert(actresses)
+          .values({
+            name: input.name,
+            japaneseName: input.japaneseName,
+            chineseName: input.chineseName,
+            bio: input.bio,
+            profileImageUrl: input.profileImageUrl,
+            birthDate: input.birthDate,
+            tags: input.tags || [],
+          })
+          .$returningId();
 
-        // ===== 回查刚插入的行以获取自增 ID =====
-        // 按 name 精确匹配 + createdAt 降序取第一条。
-        // 之所以这么绕，是因为 Drizzle 的 MySQL insert 返回类型未暴露 insertId
-        // （V1 的 videos 路由用 `(result as any).insertId` 硬取，其实更准确）。
-        // ⚠️ 已知竞态：同名女优并发创建时可能取到别人刚插入的那一行；
-        //    createdAt 只精确到秒会加剧这一点。
-        // `descOrder` 是 drizzle 的 `desc` 重命名导入，避免与其他标识符冲突。
-        // Get the created actress
-        const created = await db
-          .select()
-          .from(actresses)
-          .where(eq(actresses.name, input.name))
-          .orderBy(descOrder(actresses.createdAt))
-          .limit(1);
+        // ===== 取刚插入行的自增 ID =====
+        // 修复：原实现是「按 name 精确匹配 + createdAt DESC LIMIT 1」回查，
+        // 同名女优并发创建时会取到别人刚插入的那一行（createdAt 只精确到秒会放大窗口）。
+        // 后果不只是返回值错：`client/src/components/ActressManagementUI.tsx` 拿到
+        // actressId 后立刻调 `uploadActressFaceImage`，会把 A 的人脸特征写进 B 的
+        // actress_face_embeddings 行——以图搜人从此返回错误的女优。
+        // 改用 Drizzle 的 `$returningId()`：它基于驱动返回的 insertId + 自增主键
+        // （actresses.id 是 autoincrement + primaryKey）还原出 `[{ id: number }]`，无竞态。
+        // （注意不能写成 `(result as any).insertId`——drizzle-orm/mysql2 的 INSERT 结果是
+        //   数组 `[ResultSetHeader, FieldPacket[]]`，那样取恒为 undefined。）
+        // 与 `videos.ts` / `videos-v2.ts` 的 create 保持同一写法。
+        // Get created actress id
+        const actressId = inserted[0].id;
 
-        // 用可选链取 id：回查落空时返回 undefined 而不抛错 ——
-        // 插入本身已经成功，为一次辅助查询失败而报错会误导调用方。
-        // 但前端若依赖 actressId 做后续跳转，需要自行处理 undefined。
         return {
           success: true,
           message: "Actress created successfully",
-          actressId: created[0]?.id,
+          actressId,
         };
       } catch (error) {
         console.error("[Actress Management V2] Error creating actress:", error);
@@ -251,9 +251,6 @@ export const actressManagementV2Router = router({
         // 「未传的字段保持原值，传了空值则确实清空」。
         // 必须用 `!== undefined` 而非 truthy 判断，否则 `bio: ""`、`tags: []`
         // 这类合法的"清空"操作会被静默吞掉。
-        // ⚠️ 缺一个空对象守卫：只传 `id` 而不传任何字段时 updateData 为 {}，
-        //    Drizzle 的 mapUpdateSet 会抛 `Error("No values to set")`，
-        //    最终表现为一个语义不明的 500 —— 见 observations。
         // Build update object
         const updateData: any = {};
         if (input.name !== undefined) updateData.name = input.name;
@@ -264,10 +261,17 @@ export const actressManagementV2Router = router({
         if (input.birthDate !== undefined) updateData.birthDate = input.birthDate;
         if (input.tags !== undefined) updateData.tags = input.tags;
 
-        await db
-          .update(actresses)
-          .set(updateData)
-          .where(eq(actresses.id, input.id));
+        // 修复：补上空对象守卫。input 里除 id 外全部 optional，只传 `{ id }`（表单未改动直接
+        // 提交、或只做存在性校验的空保存）时 updateData 为 {}，Drizzle 的 mapUpdateSet 剔除
+        // undefined 后 entries 为空会抛 `Error("No values to set")`，被下面的 catch 原样上抛成
+        // 语义不明的 500。此时视为「无字段需更新」直接跳过 UPDATE，返回成功。
+        // 与 `videos-v2.ts` 的 update 保持同一写法。
+        if (Object.keys(updateData).length > 0) {
+          await db
+            .update(actresses)
+            .set(updateData)
+            .where(eq(actresses.id, input.id));
+        }
 
         return {
           success: true,

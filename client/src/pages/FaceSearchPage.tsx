@@ -24,7 +24,6 @@
  *   3. 两种模式的结果各自存在独立 state，切换模式不会清空对方的结果（有意保留，便于来回对比）。
  */
 import { useState, useRef } from "react";
-import { useAuth } from "@/_core/hooks/useAuth";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -36,8 +35,9 @@ import { useLocation } from "wouter";
 /**
  * 女优相似度检索页组件。
  *
- * 权限：public —— 页面本身不做登录守卫；`user?.id` 只是作为可选参数传给后端用于
- *       记录 face_search_history，未登录时为 undefined，检索照常可用。
+ * 权限：public —— 页面本身不做登录守卫，未登录也能检索。
+ *       修复：不再从前端传 `user?.id`，face_search_history 的归属由后端从 session
+ *       (`ctx.user`) 推导；未登录时后端直接跳过写历史，检索照常可用。
  *
  * 内部状态职责：
  *   - searchMode    当前检索模式（"name" | "image"），决定输入区与结果区的渲染分支
@@ -54,7 +54,6 @@ import { useLocation } from "wouter";
  * 副作用：写 S3（图片模式）、调 LLM（图片模式）、写 face_search_history（后端侧）。
  */
 export default function FaceSearchPage() {
-  const { user } = useAuth();
   const [, setLocation] = useLocation();
   const [searchMode, setSearchMode] = useState<"image" | "name">("name");
   const [imagePreview, setImagePreview] = useState<string>("");
@@ -96,7 +95,7 @@ export default function FaceSearchPage() {
   /**
    * 执行「按图片检索」：上传 → 检索 → 渲染结果 + toast 反馈。
    *
-   * 权限：public procedure；`userId` 传入后后端会写一条 face_search_history。
+   * 权限：public procedure；后端仅在请求带有效登录态时写一条 face_search_history。
    * 副作用：写 S3；调 LLM 图像分析；更新 imageResults；弹 toast。
    * 抛错：所有异常统一被 catch 成 toast.error，不向上冒泡。
    */
@@ -131,9 +130,10 @@ export default function FaceSearchPage() {
       // Search by uploaded image URL
       // threshold: 0.3 —— 相似度下限（0~1）。这里刻意放得很宽（ChatPage 用的是 0.7），
       // 因为本页是「专门来找相似女优」的场景，宁可多召回让用户自己挑，也不要空结果
+      // 修复：不再上传 userId —— 检索历史的归属由服务端从 session 推导，
+      // 客户端指定 userId 会让匿名请求把历史写进他人名下（越权写入）
       const result = await searchByImageMutation.mutateAsync({
         imageUrl: uploadResult.url,
-        userId: user?.id,
         threshold: 0.3,
       });
       setImageResults(result);
@@ -155,7 +155,7 @@ export default function FaceSearchPage() {
    * 与图片模式的差别：无需上传，直接把名字交给后端做匹配，
    * 返回值除相似女优列表外还带该女优的出演视频（videos）。
    *
-   * 权限：public procedure；userId 可选，用于写检索历史。
+   * 权限：public procedure；检索历史归属由后端从 session 推导，未登录则不写。
    * 副作用：更新 nameResults；弹 toast。异常统一转 toast.error。
    */
   const handleSearchByName = async () => {
@@ -168,9 +168,9 @@ export default function FaceSearchPage() {
     setNameResults(null);
     try {
       // limit: 10 —— 相似女优最多返回 10 人，与三列网格（约 3~4 行）的展示容量匹配
+      // 修复：同上，userId 不再由客户端传递，服务端取 ctx.user
       const result = await searchByNameMutation.mutateAsync({
         actressName: actressName.trim(),
-        userId: user?.id,
         limit: 10,
       });
       setNameResults(result);

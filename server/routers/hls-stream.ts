@@ -34,7 +34,8 @@
  *    真实切片模式（HLS_MODE=real）走 CDN，见 `_core/hlsRoutes.ts`。
  * 2. **SSAI 用 `#EXT-X-DISCONTINUITY` 包裹广告**：告诉播放器广告片段与正片的
  *    编码参数/时间戳不连续，避免解码器状态错乱。
- * 3. **广告选取每个坑位只留 1 条**：`slice(0, 1)`，防止连播多支广告导致跳出率飙升。
+ * 3. **广告选取每个坑位只留 1 条**：先按 `ads.priority` 降序排序再 `slice(0, 1)`，
+ *    既保证高优先级（付费）广告优先展示，也防止连播多支广告导致跳出率飙升。
  * 4. **mid-roll 不插入最后 30 秒**：`insertAt < videoDuration - 30`，避免结尾处
  *    广告与 post-roll 撞车、以及用户已快看完时被打断。
  */
@@ -194,6 +195,9 @@ function buildManifest(
  * 选取条件（SQL 层）：投放位启用 AND 广告素材启用 AND
  * （videoId 精确命中该视频 OR videoId IS NULL 表示全局投放）。
  *
+ * 命中多条时的取舍（内存层）：三个坑位（pre-roll / post-roll / 每个 mid-roll 插播点）
+ * 各自按 `ads.priority` 降序排序后只保留 1 条，priority 相等则保持 SQL 返回顺序。
+ *
  * @param db            Drizzle DB 实例（类型为 any，因 getDb() 返回值可能为 null 需调用方先判空）
  * @param videoId       视频 id
  * @param videoDuration 视频总时长（秒），用于计算 mid-roll 重复插播点
@@ -282,17 +286,22 @@ async function getAdsForVideo(
   }
 
   // Sort by priority (higher first) and limit to 1 ad per slot
-  // ⚠️ 注释说的「按 priority 排序」实际并未实现——ads.priority 字段既没进 SELECT
-  // 投影，也没参与任何 sort，这里只是简单取数组首元素。
-  // 因此当同一坑位有多条投放规则时，最终展示哪支广告取决于 SQL 返回顺序（不确定）。
+  // 修复：真正实现「按 priority 降序挑选」——此前只有注释与字段声明，slice(0,1) 直接
+  // 取数组首元素，最终展示哪支广告取决于 SQL 返回顺序（通常是主键顺序），运营配置的
+  // priority 完全无效。现在三个坑位一律先 sort 再 slice。
+  // 排序前先复制（slice()），避免原地改动调用方可见的数组顺序；priority 相等时
+  // Array.prototype.sort 在 V8 中稳定，保持 SQL 返回的原有相对顺序。
   // 每坑位限 1 条是产品约束：连播多支广告会显著推高跳出率。
-  const sortedPreRoll = preRoll.slice(0, 1); // Max 1 pre-roll
-  const sortedPostRoll = postRoll.slice(0, 1); // Max 1 post-roll
+  const byPriorityDesc = (a: AdSegment, b: AdSegment) => b.priority - a.priority;
+  const sortedPreRoll = preRoll.slice().sort(byPriorityDesc).slice(0, 1); // Max 1 pre-roll
+  const sortedPostRoll = postRoll.slice().sort(byPriorityDesc).slice(0, 1); // Max 1 post-roll
 
-  // 把 Map 摊平成数组（顺序即插入顺序，未排序 —— 排序在 buildManifest 里做）
+  // 把 Map 摊平成数组（顺序即插入顺序，未按 insertAt 排序 —— 那步排序在 buildManifest 里做）
+  // 修复：每个插播点内部同样先按 priority 降序排，再截取 1 条
   const midRoll: { insertAt: number; ads: AdSegment[] }[] = [];
   midRollMap.forEach((adList, insertAt) => {
-    midRoll.push({ insertAt, ads: adList.slice(0, 1) }); // Max 1 ad per mid-roll point
+    // Max 1 ad per mid-roll point
+    midRoll.push({ insertAt, ads: adList.slice().sort(byPriorityDesc).slice(0, 1) });
   });
 
   return { preRoll: sortedPreRoll, midRoll, postRoll: sortedPostRoll };

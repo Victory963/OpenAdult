@@ -259,6 +259,7 @@ export const videoUploadRouter = router({
    *
    * @param input.sessionId 会话句柄
    * @returns { success, videoId, videoUrl, storageKey, metadata, message }
+   *          videoId 取自 Drizzle 的 `$returningId()`（新行自增主键），前端据此跳转详情页
    *
    * @throws TRPCError FORBIDDEN             非 admin
    * @throws TRPCError BAD_REQUEST           会话不存在，或分片数与 totalChunks 不符
@@ -421,20 +422,30 @@ export const videoUploadRouter = router({
         // 与 V2 不同 —— V2 存的是相对路径 `/manus-storage/<key>`（走服务端存储代理），
         // 两者混存会让前端 videoUrl 处理逻辑（client/src/lib/videoUrl.ts）必须兼容两种形态。
         // thumbnailUrl 同样是绝对 URL（与 V2 的封面形态一致）。
-        const result = await db.insert(videos).values({
-          title: aiAnalysis.title,
-          description: aiAnalysis.description,
-          videoUrl: url,
-          thumbnailUrl,
-          category: aiAnalysis.category,
-          duration: videoDuration,
-          tags: [],
-          views: 0,
-          rating: "0",
-        });
+        const inserted = await db
+          .insert(videos)
+          .values({
+            title: aiAnalysis.title,
+            description: aiAnalysis.description,
+            videoUrl: url,
+            thumbnailUrl,
+            category: aiAnalysis.category,
+            duration: videoDuration,
+            tags: [],
+            views: 0,
+            rating: "0",
+          })
+          .$returningId();
 
-        // MySQL 驱动返回的 insertId 未包含在 Drizzle 的类型里，故 as any 强转。
-        const videoId = (result as any).insertId;
+        // 修复：原写法 `(result as any).insertId` 恒为 undefined。
+        // drizzle-orm/mysql2 对 INSERT 返回的是**数组** `[ResultSetHeader, FieldPacket[]]`
+        //（见 node_modules/drizzle-orm/mysql2/session.d.ts 的 MySqlRawQueryResult），
+        // 数组本身没有 insertId 属性，as any 只是把类型错误掩盖掉了。
+        // 后果：videos 行已成功落库，但返回给前端的 videoId 恒为 undefined，
+        // 客户端拿不到新视频 ID，无法跳转详情页或做后续的女优关联。
+        // 改用 Drizzle 官方的 `$returningId()`：它按自增主键把 insertId 还原成
+        // `[{ id: number }]`。与 V1 videos.ts createVideo 的修复保持同一模式。
+        const videoId = inserted[0].id;
 
         // Clean up session
         // 成功后立即释放内存中的分片 Buffer（不等定时任务），这是内存回收的主路径。

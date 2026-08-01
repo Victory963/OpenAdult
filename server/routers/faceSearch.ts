@@ -61,9 +61,12 @@ export const faceSearchRouter = router({
    *
    * @param input.imageUrl  待分析图片的可公开访问 URL（需能被 LLM 服务端拉取，
    *                        本地 /manus-storage/ 相对路径可能无法被 LLM 访问 —— 调用方需传绝对 URL）
-   * @param input.userId    可选。传入时才落库检索历史（未登录用户不记录）
    * @param input.threshold 相似度阈值 0~1，默认 0.7。**注意：当前实现中该参数未被使用**，
    *                        实际下限由 prompt 中的 "similarity > 0.3" 约束
+   *
+   * 权限说明：本 procedure 仍是 public（匿名也能检索），但**检索历史的归属 userId
+   * 一律取自 `ctx.user`（session cookie 解析而来），不接受客户端指定**。
+   * 未登录时不写历史。
    *
    * @returns `{ success, matches[], topMatch, analysis, message }`
    *          - `matches[]`：`{ actressId, name, similarity, profileImage, reason, videoCount }`
@@ -77,11 +80,13 @@ export const faceSearchRouter = router({
     .input(
       z.object({
         imageUrl: z.string(),
-        userId: z.number().int().positive().optional(),
+        // 修复：删除客户端可指定的 userId 入参。原实现允许匿名调用方传任意 userId，
+        // 把「攻击者控制的 imageUrl」写进受害者名下的 face_search_history
+        // （与 getHistory 越权读取同源的缺陷，只是方向相反：伪造写入他人历史）。
         threshold: z.number().min(0).max(1).default(0.7),
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
@@ -260,10 +265,13 @@ Match these actresses to the face analysis. Consider name associations, bio desc
         // 写历史是「尽力而为」的副作用：包在独立 try/catch 里，
         // 落库失败只 warn，绝不影响已经算好的检索结果返回给用户。
         // matchedActressIds 以 JSON 字符串存进 text 列（schema 未用 JSON 类型）。
-        if (input.userId) {
+        // 修复：归属 userId 改为从 ctx.user 取（public procedure 下类型为 User | null，
+        // 故用可选链）；未登录时 uid 为 undefined，直接跳过写历史。
+        const uid = ctx.user?.id;
+        if (uid) {
           try {
             await db.insert(faceSearchHistory).values({
-              userId: input.userId,
+              userId: uid,
               uploadedImageUrl: input.imageUrl,
               matchedActressIds: JSON.stringify(matches.map((a) => a.actressId)),
               topMatchActressId: topMatch?.actressId || null,
@@ -300,8 +308,10 @@ Match these actresses to the face analysis. Consider name associations, bio desc
    * 全部转小写后做 `includes` 子串匹配（大小写不敏感）。
    *
    * @param input.actressName 检索关键词，至少 1 字符
-   * @param input.userId      可选。传入时才落库检索历史
    * @param input.limit       返回女优条数上限 1~20，默认 10（视频固定最多 20 条，不受此参数影响）
+   *
+   * 权限说明：同 `searchByImage` —— procedure 仍为 public，但检索历史的归属 userId
+   * 只取自 `ctx.user`，不接受客户端指定；未登录时不写历史。
    *
    * @returns `{ success, actresses[], videos[], message }`
    *          - `actresses[]`：按 similarity 降序，已按 limit 截断
@@ -315,11 +325,12 @@ Match these actresses to the face analysis. Consider name associations, bio desc
     .input(
       z.object({
         actressName: z.string().min(1),
-        userId: z.number().int().positive().optional(),
+        // 修复：同 searchByImage —— 删除客户端可指定的 userId，
+        // 防止匿名调用方向任意用户名下伪造检索历史。
         limit: z.number().int().min(1).max(20).default(10),
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
@@ -412,10 +423,12 @@ Match these actresses to the face analysis. Consider name associations, bio desc
         // 同 searchByImage：写历史失败只 warn 不中断。
         // uploadedImageUrl = null 是区分「名字检索」与「图片检索」两类历史记录的标志位。
         // 注意：这里记录的是**截断前**的全部命中 id（未受 input.limit 限制）。
-        if (input.userId) {
+        // 修复：归属 userId 改为从 ctx.user 取，不再由客户端入参指定。
+        const uid = ctx.user?.id;
+        if (uid) {
           try {
             await db.insert(faceSearchHistory).values({
-              userId: input.userId,
+              userId: uid,
               uploadedImageUrl: null,
               matchedActressIds: JSON.stringify(scoredActresses.map((a) => a.id)),
               topMatchActressId: scoredActresses[0]?.id || null,

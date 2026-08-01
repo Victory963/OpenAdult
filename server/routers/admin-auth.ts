@@ -33,8 +33,11 @@
  * 1. **admin_credentials 表不在 drizzle/schema.ts 中**：它由 `ensureAdminCredentials()`
  *    在首次登录时用 `CREATE TABLE IF NOT EXISTS` 运行时自建，因此没有类型、没有迁移文件，
  *    也无法用 Drizzle 的查询构造器访问 —— 这正是下面全部走裸 SQL 的原因。
- * 2. **默认凭据 admin / admin**：表为空时自动播种。部署后**必须**立即通过
- *    `changeCredentials` 修改，否则等于管理面板无防护。
+ * 2. **首个管理员账号来自环境变量**：表为空时**只有**在配置了 `ADMIN_INITIAL_PASSWORD`
+ *    的前提下才播种（用户名取 `ADMIN_INITIAL_USERNAME`，默认 `admin`）。
+ *    未配置则**不播种任何账号**，login 一律返回「凭据错误」。
+ *    历史实现曾无条件播种 admin / admin —— 这是公开可知的默认口令，任何人都能在
+ *    全新部署的「运维还没来得及改密」窗口期内抢先登录并拿到 30 天 admin cookie，已修复。
  * 3. **裸 SQL 一律参数化**：所有含外部输入的语句都用 Drizzle 的 `sql` 模板标签
  *    （值被编译成 `?` 占位符，由 mysql2 驱动绑定），**不再**用 `sql.raw` 拼字符串。
  *    只有完全静态、不含任何变量的 DDL / COUNT 语句仍走 `sql.raw`。
@@ -128,18 +131,30 @@ function getAdminCookie(req: { headers: { cookie?: string } }): string | undefin
 }
 
 /**
- * 幂等地确保 `admin_credentials` 表存在，且至少有一个管理员账号。
+ * 幂等地确保 `admin_credentials` 表存在；仅在**显式配置了初始口令**时播种首个管理员账号。
  *
  * 这张表**没有**定义在 `drizzle/schema.ts` 里，也没有对应的迁移文件，
  * 而是在每次 `login` 前用 `CREATE TABLE IF NOT EXISTS` 惰性自建。
  * 这样做的好处是部署时无需额外迁移步骤；代价是它游离于 schema 之外，
  * 只能用裸 SQL（参数化的 `sql` 模板标签）访问，且 `pnpm db:push` 不会管理它。
  *
- * 播种逻辑：表内行数为 0 时，插入默认账号 **admin / admin**（密码经 bcrypt cost=10 哈希）。
+ * 播种逻辑（表内行数为 0 时）：
+ * - `ADMIN_INITIAL_PASSWORD` **未配置或为空** → **不插入任何账号**，仅打一条 error 日志。
+ *   此时 login 查不到行，统一返回「IDまたはパスワードが正しくありません」，
+ *   管理面板处于「无账号 = 无法登录」的安全默认态（fail-closed）。
+ * - 已配置 → 用户名取 `ADMIN_INITIAL_USERNAME`（缺省 `admin`），
+ *   口令经 bcrypt cost=10 哈希后写入，并打日志提醒尽快通过 `changeCredentials` 改密。
  *
- * @sideEffect 可能执行 DDL（建表）与 DML（插入默认账号）
+ * @sideEffect 可能执行 DDL（建表）与 DML（插入初始账号）
  * @remarks
- * - ⚠️ **安全**：默认凭据 admin/admin 是公开可知的，部署后必须立刻改掉。
+ * - ⚠️ **安全**（修复要点）：历史实现无条件播种硬编码的 admin / admin。由于本函数在
+ *   每次 login 前无条件执行，全新部署时攻击者只需抢先调用一次
+ *   `login {username:"admin", password:"admin"}`，即可在同一次调用里触发播种并登录成功，
+ *   拿到 30 天有效的 `admin_session_id`（该 cookie 同时被 ad-management / actressManagement /
+ *   _core/fastUpload 认可，等于全站 CRUD + 上传通道沦陷）。现改为必须显式配置初始口令。
+ * - 本文件按项目约定本应从 `_core/env.ts` 的 `ENV` 读配置，但此处直接读 `process.env`：
+ *   `ENV` 是模块加载期的快照且不含这两个键，而本轮修复限定只改本文件；
+ *   同样的直读方式在 `_core/hlsRoutes.ts`（`ADMIN_API_KEY`）中已有先例。
  * - 整个函数用 try/catch 吞掉所有异常并只打 console.error —— 建表失败时不会阻断流程，
  *   而是让后续的 SELECT 抛错，报错信息会比较费解。
  * - 每次 login 都会跑一遍建表 + COUNT，属于可优化的额外开销（可加进程内标志位缓存）。
@@ -164,13 +179,30 @@ async function ensureAdminCredentials() {
     // 这个取值形状在本文件的每处查询中都重复出现。
     const cnt = (rows as any)[0]?.[0]?.cnt ?? 0;
     if (Number(cnt) === 0) {
+      // 修复：硬编码默认凭据 admin/admin —— 初始口令改为必须由部署方通过
+      // ADMIN_INITIAL_PASSWORD 显式提供；未提供则**不播种任何账号**（fail-closed），
+      // 避免全新部署存在「公开可知的默认口令」窗口期。
+      const initialPassword = process.env.ADMIN_INITIAL_PASSWORD ?? "";
+      if (initialPassword.length === 0) {
+        console.error(
+          "[AdminAuth] admin_credentials is empty and ADMIN_INITIAL_PASSWORD is not set — " +
+            "refusing to seed a default account. Admin login stays disabled until you set " +
+            "ADMIN_INITIAL_PASSWORD (or insert a bcrypt-hashed row yourself)."
+        );
+        return;
+      }
+      const initialUsername = (process.env.ADMIN_INITIAL_USERNAME ?? "admin").trim() || "admin";
       // bcrypt cost factor = 10：约 2^10 轮加盐迭代，是 bcrypt 的通用默认值，
       // 在「单次哈希约 50~100ms」与「抗暴力破解」之间取平衡。
-      const hashed = await bcrypt.hash("admin", 10);
+      const hashed = await bcrypt.hash(initialPassword, 10);
       // 修复：SQL 注入 —— 改用参数化的 `sql` 模板标签（值编译为 `?` 由驱动绑定），
-      // 不再用 sql.raw 拼接 + 手工 `'`→`''` 转义。
+      // 不再用 sql.raw 拼接 + 手工 `'`→`''` 转义。用户名同样走占位符。
       await db.execute(
-        sql`INSERT INTO admin_credentials (username, passwordHash) VALUES ('admin', ${hashed})`
+        sql`INSERT INTO admin_credentials (username, passwordHash) VALUES (${initialUsername}, ${hashed})`
+      );
+      console.warn(
+        `[AdminAuth] Seeded initial admin account "${initialUsername}" from ADMIN_INITIAL_PASSWORD. ` +
+          "Change it via adminAuth.changeCredentials and remove the env var afterwards."
       );
     }
   } catch (e) {
@@ -203,14 +235,15 @@ export const adminAuthRouter = router({
   /**
    * 【public / mutation】管理员账号密码登录。
    *
-   * 流程：确保表与默认账号存在 → 按用户名查出 passwordHash → bcrypt 比对 →
-   * 签发 30 天 JWT → 写入 HttpOnly cookie。
+   * 流程：确保表存在（并在配置了 `ADMIN_INITIAL_PASSWORD` 时播种首个账号）→
+   * 按用户名查出 passwordHash → bcrypt 比对 → 签发 30 天 JWT → 写入 HttpOnly cookie。
    *
    * @param input.username 用户名
    * @param input.password 明文密码（依赖 HTTPS 传输保护；服务端不落库、不打日志）
    * @returns `{ success: true, username }`
    *
-   * @sideEffect 可能建表/播种默认账号；读库 1 次；在响应上设置 `admin_session_id` cookie
+   * @sideEffect 可能建表/播种初始账号（仅当配置了 `ADMIN_INITIAL_PASSWORD`）；
+   *             读库 1 次；在响应上设置 `admin_session_id` cookie
    * @throws TRPCError INTERNAL_SERVER_ERROR — DB 不可用
    * @throws TRPCError UNAUTHORIZED — 用户名不存在或密码错误
    *
@@ -219,6 +252,9 @@ export const adminAuthRouter = router({
    *   避免通过错误信息枚举出有效用户名。
    *   但两条分支的耗时不同（前者不跑 bcrypt），理论上存在时序侧信道。
    * - ⚠️ 无登录失败次数限制 / 无验证码 / 无锁定，可被在线暴力破解。
+   * - 表为空且未配置 `ADMIN_INITIAL_PASSWORD` 时，任何用户名/密码组合都会命中
+   *   「用户不存在」分支并返回凭据错误 —— 这是刻意的 fail-closed 行为（见
+   *   `ensureAdminCredentials`），排查时请先看服务端 `[AdminAuth]` 日志。
    * - 用户名以参数化占位符传入（`sql` 模板标签），不参与 SQL 文本拼接，无注入风险。
    */
   login: publicProcedure

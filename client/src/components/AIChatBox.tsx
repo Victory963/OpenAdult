@@ -37,6 +37,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { Loader2, Send, User, Sparkles } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
+import { useComposition } from "@/hooks/useComposition";
 import { Streamdown } from "streamdown";
 
 /**
@@ -249,21 +250,37 @@ export function AIChatBox({
    *    这个内部节点上，对外层容器调 scrollTo 完全无效。
    * 2. 包一层 requestAnimationFrame —— 发送消息后 DOM 尚未完成本帧布局，
    *    立刻读 scrollHeight 拿到的是旧值，会滚不到真正的底部。
+   *
+   * @returns rAF 句柄（找不到 viewport 时为 undefined），供 effect 在清理阶段 cancel。
    */
-  const scrollToBottom = () => {
+  const scrollToBottom = (): number | undefined => {
     const viewport = scrollAreaRef.current?.querySelector(
       '[data-radix-scroll-area-viewport]'
     ) as HTMLDivElement;
 
-    if (viewport) {
-      requestAnimationFrame(() => {
-        viewport.scrollTo({
-          top: viewport.scrollHeight,
-          behavior: 'smooth'
-        });
+    if (!viewport) return undefined;
+
+    return requestAnimationFrame(() => {
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: 'smooth'
       });
-    }
+    });
   };
+
+  // ── 消息变化时自动滚到底部 ────────────────────────────────────────────────
+  // 修复：组件文档声称 "Auto-scrolls to latest message"，但 scrollToBottom() 原先只在
+  //       handleSubmit 里调用一次。assistant 回复是调用方 append 进 messages 的，
+  //       没有任何 effect 监听，导致模型回复到达后并不会自动滚动，行为与文档不符。
+  // 依赖取 length 与 isLoading（而非 messages 数组本身）：调用方每次渲染都可能传入新数组，
+  // 直接依赖数组会让 effect 每次渲染都跑；条数/加载态变化才是真正需要滚动的时机。
+  // 本 effect 只读 DOM、不 setState，因此不会引发 re-render 循环。
+  useEffect(() => {
+    const rafId = scrollToBottom();
+    return () => {
+      if (rafId !== undefined) cancelAnimationFrame(rafId);
+    };
+  }, [displayMessages.length, isLoading]);
 
   /**
    * 发送消息。
@@ -290,9 +307,9 @@ export function AIChatBox({
   /**
    * 键盘快捷键：Enter 发送，Shift+Enter 换行。
    *
-   * @remarks ⚠️ 未处理输入法组合态（IME composition）。日文/中文输入时按 Enter 确认候选词
-   *          会被当成「发送」，导致半成品文本被提交。项目里已有 `@/hooks/useComposition`
-   *          专门解决该问题，但本组件未接入（见 observations）。
+   * @remarks 本函数**不再**直接绑到 textarea 上，而是作为 `useComposition` 的
+   *          `onKeyDown` 透传给它——组合态期间该 Hook 会吞掉 Enter/Escape 不予转发，
+   *          因此进到这里的 Enter 一定是「真的想发送」而非 IME 确认候选词。
    */
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -300,6 +317,14 @@ export function AIChatBox({
       handleSubmit(e);
     }
   };
+
+  // 修复：接入 IME 组合态处理。此前日文/中文输入时按 Enter 确认候选词会被当成「发送」，
+  //       把半成品文本提交出去。useComposition 返回的三个事件处理器必须**成套**绑到
+  //       同一个 textarea 上：它在 compositionstart/end 之间把 Enter/Escape 拦下，
+  //       不转发给 handleKeyDown；组合结束后再延迟复位（兼容 Safari 的事件顺序）。
+  const compositionHandlers = useComposition<HTMLTextAreaElement>({
+    onKeyDown: handleKeyDown,
+  });
 
   return (
     <div
@@ -435,7 +460,11 @@ export function AIChatBox({
           ref={textareaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
+          // 修复：逐个绑定而非整组展开 —— useComposition 的返回值里还有一个
+          // `isComposing` 查询函数，若 {...compositionHandlers} 会被当作未知 DOM 属性透传
+          onCompositionStart={compositionHandlers.onCompositionStart}
+          onCompositionEnd={compositionHandlers.onCompositionEnd}
+          onKeyDown={compositionHandlers.onKeyDown}
           placeholder={placeholder}
           // rows=1 + min-h-9 起步为单行；max-h-32（128px）封顶，长文本内部滚动，
           // 防止输入区无限增高把消息区挤没

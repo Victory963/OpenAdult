@@ -102,7 +102,8 @@
  *    由 Maps SDK 修改的 DOM。父组件要操控地图，靠 `onMapReady` 拿到实例自行保存。
  * 2. **走 Forge 代理而非 maps.googleapis.com 直连**：API Key 由网关侧兜底/限流，
  *    前端只带一个受限的 `VITE_FRONTEND_FORGE_API_KEY`。
- * 3. **script 加载没有去重**：多个 MapView 同时挂载会重复注入脚本（见 observations）。
+ * 3. **script 加载做了单例去重**：模块级 `mapScriptPromise` 保证同一页面只注入一次
+ *    脚本，多个 MapView 并存或 StrictMode 下 effect 双跑都只会共享同一个 Promise。
  * 4. **无卸载清理**：组件卸载时不销毁 map 实例，也不移除事件监听。Maps SDK 没有
  *    官方 destroy API，通常靠容器 DOM 被移除后 GC 回收，但监听器可能残留。
  */
@@ -131,7 +132,19 @@ const FORGE_BASE_URL =
 const MAPS_PROXY_URL = `${FORGE_BASE_URL}/v1/maps/proxy`;
 
 /**
- * 动态注入 Google Maps JS SDK 并在 onload 时 resolve。
+ * 模块级单例：正在进行中（或已完成）的脚本加载 Promise。
+ *
+ * 修复：原实现每次调用都新建一个 `<script>`，同页面挂载多个 MapView、或 React
+ * StrictMode 下 effect 双跑时会重复注入，Google Maps SDK 会在控制台报
+ * "You have included the Google Maps JavaScript API multiple times"。
+ * 缓存单例后，后续调用一律复用同一个 Promise。
+ *
+ * 加载**失败**时会被重置回 null，使下一次挂载可以重试。
+ */
+let mapScriptPromise: Promise<void> | null = null;
+
+/**
+ * 动态注入 Google Maps JS SDK，并在 onload 时 resolve、onerror 时 reject。
  *
  * URL 各参数含义：
  * - `key`       —— Forge 前端 API Key（非 Google 原生 Key，由网关换发）
@@ -139,15 +152,21 @@ const MAPS_PROXY_URL = `${FORGE_BASE_URL}/v1/maps/proxy`;
  * - `libraries` —— 按需加载的可选库，这里一次性载入 marker/places/geocoding/geometry
  *                  四个（见文件顶部速查手册），避免后续再动态 importLibrary
  *
- * @returns Promise，脚本 load 完成后 resolve(null)
- * @副作用 向 `document.head` 注入 `<script>`；执行后把 `google` 命名空间挂到 window 上。
- *
- * ⚠️ 两个已知问题（见 observations）：
- *   - 加载失败时只 `console.error`，Promise **永远不 resolve/reject**，调用方会一直挂起；
- *   - 无「已加载」判重，重复调用会重复注入脚本、重复触发 SDK 初始化。
+ * @returns Promise，脚本 load 完成后 resolve；加载失败时 **reject**（调用方必须 catch）。
+ * @副作用 向 `document.head` 注入 `<script>`（每个页面至多一次）；
+ *         执行后把 `google` 命名空间挂到 window 上。
  */
-function loadMapScript() {
-  return new Promise(resolve => {
+function loadMapScript(): Promise<void> {
+  // 修复：已有进行中/已完成的加载则直接复用，避免重复注入脚本
+  if (mapScriptPromise) return mapScriptPromise;
+
+  // SDK 已经由别处（或上一次加载）挂到 window 上时，无需再注入
+  if (window.google?.maps) {
+    mapScriptPromise = Promise.resolve();
+    return mapScriptPromise;
+  }
+
+  mapScriptPromise = new Promise<void>((resolve, reject) => {
     const script = document.createElement("script");
     script.src = `${MAPS_PROXY_URL}/maps/api/js?key=${API_KEY}&v=weekly&libraries=marker,places,geocoding,geometry`;
     // async：不阻塞 HTML 解析；crossOrigin=anonymous：让跨域脚本的错误堆栈可读，
@@ -155,16 +174,23 @@ function loadMapScript() {
     script.async = true;
     script.crossOrigin = "anonymous";
     script.onload = () => {
-      resolve(null);
+      resolve();
       // 脚本执行完毕后其副作用（window.google）已经生效，
       // 移除 <script> 标签只是清理 DOM，不会卸载已加载的 SDK。
       script.remove(); // Clean up immediately
     };
     script.onerror = () => {
-      console.error("Failed to load Google Maps script");
+      // 修复：原来只 console.error，既不 resolve 也不 reject，返回的 Promise 永久 pending，
+      //       调用方 `await loadMapScript()` 之后的代码永远不执行 —— 地图区永久空白且无提示。
+      //       现在改为 reject，并把单例置空以便下次挂载重试。
+      mapScriptPromise = null;
+      script.remove();
+      reject(new Error("Failed to load Google Maps script"));
     };
     document.head.appendChild(script);
   });
+
+  return mapScriptPromise;
 }
 
 /**
@@ -210,7 +236,14 @@ export function MapView({
   //   2. 同时保证函数体里读到的 initialZoom/initialCenter/onMapReady 是最新值，
   //      不会像普通 useCallback(fn, []) 那样闭包捕获过期的 props。
   const init = usePersistFn(async () => {
-    await loadMapScript();
+    // 修复：loadMapScript 现在会在加载失败时 reject，必须 catch，
+    //       否则会产生未处理的 Promise rejection（且没有任何用户可见的反馈）。
+    try {
+      await loadMapScript();
+    } catch (error) {
+      console.error("Failed to load Google Maps script", error);
+      return;
+    }
     // 这一步在 await 之后，组件可能已经卸载（ref 被置空），此时安全退出。
     if (!mapContainer.current) {
       console.error("Map container not found");

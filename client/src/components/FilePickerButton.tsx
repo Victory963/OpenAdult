@@ -23,7 +23,9 @@
  * 2. **不用 `<label htmlFor>` 而用 ref + click()**：因为要复用 shadcn Button 的样式与
  *    行为（它渲染的是 `<button>`），用 label 包裹会破坏按钮语义与键盘焦点表现。
  * 3. **每次选完就清空 input.value**：见 handleFileChange 注释，这是让「重复选择同一个
- *    文件」也能触发 onChange 的关键，`FileUploadBox` 恰恰漏了这一步。
+ *    文件」也能触发 onChange 的关键（`FileUploadBox` 现已采用同样做法）。
+ * 4. **children 与 label 并存**：图标写在标签内（children），文案走 `label` prop，
+ *    两者按 `{children}{label}` 顺序渲染。
  */
 import { useRef } from "react";
 import { Button } from "@/components/ui/button";
@@ -38,10 +40,13 @@ import { ComponentProps } from "react";
  *                             注意 `accept` 只是系统选择器的**建议过滤器**，用户切到
  *                             「所有文件」仍可选任意类型，父组件不应把它当成安全校验。
  * @property label             按钮文案，默认日文「ファイルを選択」。
- *                             ⚠️ 本组件把 `{label}` 直接写成 Button 的 JSX 子节点，
- *                             而 JSX children 的优先级高于 `...buttonProps` 里透传的
- *                             `children`，因此调用方写在标签内部的图标会被**静默丢弃**
- *                             （ChatPage 的 Sparkles/Search 图标就是这样丢的，见 observations）。
+ *                             渲染顺序为 `{children}{label}` —— 调用方写在标签内部的
+ *                             图标（如 ChatPage 的 Sparkles/Search）排在文案**之前**，
+ *                             两者间距由调用方自己的 `className`（如 `gap-1`）控制。
+ *                             若只想要图标不要文案，显式传 `label=""` 即可。
+ * @property children          写在 `<FilePickerButton>…</FilePickerButton>` 之间的节点，
+ *                             一般是 lucide 图标。继承自 Button 的 props，但本组件
+ *                             **显式解构**出来自行渲染（见下方 children 的修复说明）。
  * @property ...               其余属性继承自 shadcn `Button`，原样透传。
  */
 interface FilePickerButtonProps extends ComponentProps<typeof Button> {
@@ -59,6 +64,10 @@ export default function FilePickerButton({
   onFileSelect,
   acceptedFileTypes = [".jpg", ".jpeg", ".png", ".gif", ".mp4", ".webm"],
   label = "ファイルを選択",
+  // 修复：把 children 从 buttonProps 里显式解构出来。原先它留在 `...buttonProps` 中，
+  //       而 <Button>{label}</Button> 的 JSX 子节点优先级更高，会覆盖透传的 children，
+  //       导致调用方写在标签内的图标被静默丢弃（ChatPage 的 Sparkles/Search 即如此）。
+  children,
   ...buttonProps
 }: FilePickerButtonProps) {
   // 指向下方那个被 display:none 隐藏的原生 <input type="file">。
@@ -96,6 +105,8 @@ export default function FilePickerButton({
         onClick={handleButtonClick}
         {...buttonProps}
       >
+        {/* 修复：图标（children）在前、文案（label）在后，两者都会渲染 */}
+        {children}
         {label}
       </Button>
       {/*

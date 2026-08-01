@@ -328,6 +328,11 @@ export default function VideoPlayer({
   // 状态转移：
   //   [无广告] --isPlaying 且存在 pre-roll--> [播前贴片] --倒计时归零/onEnded--> [正片]
   //   [正片]   --currentTime 落入某条 mid-roll 的触发窗口--> [播中插] --> [正片]
+  //   [正片]   --正片播放结束--> [播后贴片] --> [结束，不恢复主视频]
+  //
+  // 注意：post-roll 的触发**不在本 effect 内**，而是在主 <video> 的 onEnded 回调里。
+  // 因为服务端给 post-roll 的 triggerAt 等于视频总时长，timeupdate 的采样点几乎
+  // 不可能落到该值上（播放到末尾就直接触发 ended 了）。
   //
   // 触发靠 currentTime 变化驱动（onTimeUpdate 约每 250ms 一次），所以这个 effect
   // 是高频重跑的，必须靠开头的三条早退保证幂等。
@@ -413,7 +418,10 @@ export default function VideoPlayer({
           // Resume main video
           // 延迟 200ms 再恢复：给 React 卸载广告覆盖层 DOM 留出一帧，
           // 否则 play() 可能在主 <video> 仍被遮挡/未就绪时被浏览器拒绝
-          setTimeout(() => videoRef.current?.play(), 200);
+          // 修复：post-roll 播完不能恢复主视频 —— 正片已经结束，此时 play() 会从头重播
+          if (activeAd.position !== 'post-roll') {
+            setTimeout(() => videoRef.current?.play(), 200);
+          }
           return 0;
         }
         return prev - 1;
@@ -421,6 +429,29 @@ export default function VideoPlayer({
     }, 1000);
     return () => clearInterval(timer);
   }, [activeAd, adRemainingTime > 0]);
+
+  // 修复：把定时保存所需的高频变化值收进 ref，避免它们出现在下方 effect 的依赖数组里。
+  // 原因：currentTime 每约 250ms 更新一次、updateResumeMutation 每次渲染都是新对象，
+  // 二者一旦进入依赖数组，5 秒的 interval 会在到点之前就被 cleanup 清掉并重建，
+  // 导致「每 5 秒自动保存续播位置」实际上几乎永不触发。
+  const resumeSaveRef = useRef({
+    currentTime,
+    duration,
+    isPlaying,
+    isAdPlaying,
+    mutate: updateResumeMutation.mutate,
+  });
+  // 刻意不写依赖数组：每次渲染提交后同步一次快照，
+  // 保证 interval 回调里读到的永远是最新值（ref 写入放在 effect 里而非渲染期间）。
+  useEffect(() => {
+    resumeSaveRef.current = {
+      currentTime,
+      duration,
+      isPlaying,
+      isAdPlaying,
+      mutate: updateResumeMutation.mutate,
+    };
+  });
 
   // 续播位置定时落库：每 5 秒写一次。
   // 三个前置条件缺一不可 —— 正在播放、时长已知、当前不在放广告
@@ -430,11 +461,13 @@ export default function VideoPlayer({
     if (!videoId) return;
 
     saveIntervalRef.current = setInterval(() => {
-      if (isPlaying && duration > 0 && !isAdPlaying) {
-        updateResumeMutation.mutate({
+      // 修复：改为从 ref 读取最新播放状态，effect 只依赖 videoId，定时器不再被反复重建
+      const snapshot = resumeSaveRef.current;
+      if (snapshot.isPlaying && snapshot.duration > 0 && !snapshot.isAdPlaying) {
+        snapshot.mutate({
           videoId,
-          position: currentTime,
-          duration,
+          position: snapshot.currentTime,
+          duration: snapshot.duration,
         });
       }
     }, 5000);
@@ -444,7 +477,7 @@ export default function VideoPlayer({
         clearInterval(saveIntervalRef.current);
       }
     };
-  }, [videoId, isPlaying, currentTime, duration, updateResumeMutation, isAdPlaying]);
+  }, [videoId]);
 
   // 关闭/刷新页面前抢救一次进度。
   // 这里不判断 isPlaying —— 暂停状态下关页面同样需要保存当前位置。
@@ -881,6 +914,29 @@ export default function VideoPlayer({
           }}
           // 时长要等 metadata 就绪才可用；它同时是广告插入点计算的前置条件
           onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+          // 修复：补上 direct/overlay 模式的 post-roll（后贴片）触发。
+          // 原先的广告触发 effect 只判断 pre-roll 与 mid-roll，服务端 getVideoAds
+          // 返回的 position='post-roll'（triggerAt = 视频总时长）永远不会被消费。
+          // 放在 onEnded 而非按 currentTime 判定：triggerAt 恰好等于总时长，
+          // timeupdate 的采样点几乎不可能命中该值。
+          onEnded={() => {
+            setIsPlaying(false);
+            // SSAI 模式下广告已被服务端拼进 m3u8，客户端不重复插播
+            if (hlsManifestQuery.data?.type === 'hls') return;
+            const postRollAd = videoAdsQuery.data?.ads?.find(
+              (a) => a.position === 'post-roll'
+            );
+            if (!postRollAd) return;
+            // 与 pre-roll 同样的去重口径：重播时不再重复插播同一条后贴片
+            const key = `post-${postRollAd.adId}`;
+            if (shownAdIds.has(key)) return;
+            setActiveAd(postRollAd);
+            setIsAdPlaying(true);
+            setAdRemainingTime(postRollAd.duration);
+            setShownAdIds((prev) => new Set(prev).add(key));
+            trackAdMutation.mutate({ adId: postRollAd.adId, videoId, event: 'impression' });
+            trackAdMutation.mutate({ adId: postRollAd.adId, videoId, event: 'start' });
+          }}
         />
 
         {/* Ad Overlay - Direct Mode */}
@@ -907,7 +963,10 @@ export default function VideoPlayer({
                   setIsAdPlaying(false);
                   setAdRemainingTime(0);
                   // 同上：等覆盖层卸载后再恢复主视频（200ms 经验值）
-                  setTimeout(() => videoRef.current?.play(), 200);
+                  // 修复：post-roll 是片尾广告，播完不恢复主视频（否则正片会从头重播）
+                  if (activeAd.position !== 'post-roll') {
+                    setTimeout(() => videoRef.current?.play(), 200);
+                  }
                 }}
               />
               {/* Ad Badge */}
@@ -940,7 +999,10 @@ export default function VideoPlayer({
                     setActiveAd(null);
                     setIsAdPlaying(false);
                     setAdRemainingTime(0);
-                    setTimeout(() => videoRef.current?.play(), 200);
+                    // 修复：同上，跳过 post-roll 时同样不恢复主视频
+                    if (activeAd.position !== 'post-roll') {
+                      setTimeout(() => videoRef.current?.play(), 200);
+                    }
                   }}
                 >
                   広告をスキップ

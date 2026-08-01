@@ -21,10 +21,13 @@
  *   → localStorage["language"]（持久化用户偏好）
  *
  * 关键设计决策：
- *   默认语言为 "ja"（日语）—— 本站主要面向日本市场，而非跟随浏览器语言。
+ *   1. 默认语言为 "ja"（日语）—— 本站主要面向日本市场，而非跟随浏览器语言。
+ *   2. localStorage 偏好在 useState 惰性初始化里同步读取，**首帧即为最终语言**：
+ *      既不会出现"先渲染日语再跳成中文"的文案闪烁，Provider 也从第一次渲染起
+ *      就必然存在，消费者不存在拿不到 Context 的窗口期。
  */
 
-import React, { createContext, useContext, useState, useEffect } from "react";
+import React, { createContext, useContext, useState } from "react";
 import { Language } from "@/locales/translations";
 
 /**
@@ -41,51 +44,61 @@ interface LanguageContextType {
 const LanguageContext = createContext<LanguageContextType | undefined>(undefined);
 
 /**
+ * 读取 localStorage 中持久化的语言偏好。
+ *
+ * @returns 合法的语言代码；无偏好 / 值非法 / localStorage 不可用时返回默认值 "ja"。
+ *
+ * 说明：
+ *   - 白名单校验：localStorage 可被用户或旧版本代码写入任意值，
+ *     若不校验会导致 translations[language] 取到 undefined 而整页崩溃。
+ *   - try/catch：隐私模式或站点存储被禁用时 localStorage 访问会抛异常；
+ *     本函数在渲染期被调用，抛错等同于整棵树挂掉，故必须吞掉。
+ */
+function readStoredLanguage(): Language {
+  if (typeof window === "undefined") return "ja";
+  try {
+    const saved = window.localStorage.getItem("language");
+    if (saved && ["ja", "zh", "en"].includes(saved)) {
+      return saved as Language;
+    }
+  } catch {
+    // 忽略：降级为默认语言
+  }
+  return "ja";
+}
+
+/**
  * 多语言 Provider。
  *
  * @param children 被包裹的子树。
  *
  * 内部状态：
- *   - language : 当前生效语言，初始 "ja"（业务默认，非浏览器语言）；
- *   - isLoaded : 是否已完成 localStorage 偏好读取，用于避开首帧"语言闪烁"
- *                （先渲染日语再跳成中文）。
+ *   - language : 当前生效语言。**用 useState 惰性初始化直接从 localStorage 读取**，
+ *                因此首帧就是最终语言，既无文案闪烁，也不需要"加载完成"标志位。
  *
  * 副作用：读写 localStorage["language"]。
  */
 export function LanguageProvider({ children }: { children: React.ReactNode }) {
-  const [language, setLanguageState] = useState<Language>("ja");
-  const [isLoaded, setIsLoaded] = useState(false);
-
-  // Load language preference from localStorage
-  // 挂载后读取持久化偏好。放在 useEffect 而非 useState 惰性初始化里，
-  // 是为了配合下方 isLoaded 的"首帧不渲染 Provider"策略。
-  // 依赖数组为空 → 只执行一次，之后语言变化由 setLanguage 驱动。
-  useEffect(() => {
-    const saved = localStorage.getItem("language") as Language | null;
-    // 白名单校验：localStorage 可被用户或旧版本代码写入任意值，
-    // 若不校验会导致 translations[language] 取到 undefined 而整页崩溃。
-    if (saved && ["ja", "zh", "en"].includes(saved)) {
-      setLanguageState(saved);
-    }
-    setIsLoaded(true);
-  }, []);
+  // 修复：改为 useState 惰性初始化同步读取偏好，并删除 isLoaded 分支。
+  // 原实现在 isLoaded 为 false（即首帧）时直接返回 <>{children}</> 而不挂载
+  // Provider，导致首帧渲染的消费者（如 Dashboard）调用 useLanguage() 必然抛错。
+  // 传函数引用（而非调用结果）给 useState —— 只在首次渲染求值一次。
+  const [language, setLanguageState] = useState<Language>(readStoredLanguage);
 
   /**
    * 切换语言。
    * @param lang 目标语言代码。
    * 副作用：同步更新 state 并持久化到 localStorage，刷新后保持不变。
+   *         写入失败（隐私模式等）时只影响持久化，不影响本次会话的语言切换。
    */
   const setLanguage = (lang: Language) => {
     setLanguageState(lang);
-    localStorage.setItem("language", lang);
+    try {
+      localStorage.setItem("language", lang);
+    } catch {
+      // 忽略：无法持久化时仍保证当前会话可正常切换
+    }
   };
-
-  // 首帧（localStorage 尚未读取完成）时直接透传 children，不提供 Context。
-  // 目的是避免用错误的默认语言渲染一帧再切换造成文案闪烁。
-  // 代价：这一帧中 Context 为 undefined —— 见文件级注释与调用方约定。
-  if (!isLoaded) {
-    return <>{children}</>;
-  }
 
   return (
     <LanguageContext.Provider value={{ language, setLanguage }}>
@@ -101,9 +114,8 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
  * @throws  Error("useLanguage must be used within LanguageProvider")
  *          —— 未被 LanguageProvider 包裹时抛出（快速失败）。
  *
- * 注意：LanguageProvider 在首帧（isLoaded 为 false）会不带 Context 渲染
- * children，因此在那一帧内调用本 Hook 的组件会命中此抛错分支，
- * 由 App.tsx 最外层的 ErrorBoundary 兜住。
+ * 注意：LanguageProvider 从**首次渲染**起就挂载 Context，
+ * 因此只要组件位于 Provider 子树内，任何时刻调用本 Hook 都不会命中抛错分支。
  */
 export function useLanguage() {
   const context = useContext(LanguageContext);

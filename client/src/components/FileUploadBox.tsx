@@ -24,11 +24,14 @@
  *    `maxFileSize` 只有 100MB，真正的大视频走的是 `video-upload-v2` 分片通道。
  * 2. **图片自动分析**：上传成功后若判定为 image，会立刻再打一次 LLM。分析失败
  *    **不阻断**流程，仍会把上传结果回调给父组件（只是少了 analysisData）。
+ *    判定依据是**文件真实 MIME**（而非 `getFileType()` 的三分类兜底值），
+ *    这样 PDF 等非图片类型不会被误送去视觉分析。
  * 3. **文案全为日语硬编码**，未接入 `LanguageContext` 的 i18n（见 observations）。
  * 4. 进度条是**模拟**的，不是真实上传进度（tRPC JSON mutation 拿不到 upload
- *    progress 事件），且当前这段模拟代码的位置有问题（见 handleUpload 注释）。
+ *    progress 事件）；模拟定时器在 mutation 发起**之前**启动、在 finally 与
+ *    组件卸载时清理（见 handleUpload 注释）。
  */
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Upload, X, Image, Video, File } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -38,16 +41,20 @@ import { trpc } from "@/lib/trpc";
  * FileUploadBox 的 props 契约。
  *
  * @property onFileUpload      上传（及图片分析）完成后的回调。
- *                             注意实参顺序：第 1 个是 S3 公开 URL，第 2 个形参名虽叫
- *                             `fileType`，实际传入的却是 S3 对象键 `fileKey`（见 observations）；
- *                             第 3 个 `analysisData` 仅在「图片且 LLM 分析成功」时才有值。
+ *                             实参顺序：第 1 个是 S3 公开 URL，第 2 个是 S3 对象键
+ *                             `fileKey`（形如 `uploads/<uid>/<ts>-<name>`）；
+ *                             第 3 个 `analysisData` 仅在「图片且 LLM 分析成功」时才有值，
+ *                             其中的 `fileType` 字段才是粗分类（image/video/audio）。
+ *                             修复：形参名原为 `fileType`，与三处调用点实际传入的
+ *                             `data.fileKey` 不符，此处按真实语义更名为 `fileKey`。
  * @property maxFileSize       单文件大小上限，单位 **MB**（默认 100）。仅做前端拦截，
  *                             服务端未做等价校验。
  * @property acceptedFileTypes 传给 `<input accept>` 的扩展名数组。**只影响系统文件选择器
  *                             的过滤**，拖拽路径完全不校验扩展名。
  */
 interface FileUploadBoxProps {
-  onFileUpload?: (fileUrl: string, fileType: string, analysisData?: any) => void;
+  // 修复：第 2 个形参实际传的是 S3 对象键，原名 `fileType` 会误导父组件，改名为 `fileKey`
+  onFileUpload?: (fileUrl: string, fileKey: string, analysisData?: any) => void;
   maxFileSize?: number; // in MB
   acceptedFileTypes?: string[];
 }
@@ -76,6 +83,26 @@ export default function FileUploadBox({
   const [isUploading, setIsUploading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string>("");
+  // 修复：模拟进度定时器句柄改用 ref 持有，才能在 finally 与组件卸载时可靠清理
+  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /** 停止模拟进度定时器（幂等，可重复调用） */
+  const stopProgressSimulation = () => {
+    if (progressTimerRef.current !== null) {
+      clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+  };
+
+  // 修复：组件卸载时清理模拟进度定时器，避免对已卸载组件调用 setState
+  useEffect(() => {
+    return () => {
+      if (progressTimerRef.current !== null) {
+        clearInterval(progressTimerRef.current);
+        progressTimerRef.current = null;
+      }
+    };
+  }, []);
 
   // 两个 protected mutation：未登录时调用会被 tRPC 中间件拒绝（UNAUTHORIZED）。
   // 这里用 mutateAsync 而非 mutate，是为了在 handleUpload 里用 try/catch 串行编排。
@@ -90,9 +117,14 @@ export default function FileUploadBox({
    *
    * @param data     `uploadFile` mutation 的返回值 `{ success, url, fileKey, filename }`
    * @param fileType 由 `getFileType()` 推断出的粗分类（image/video/audio）
+   * @param mimeType 浏览器给出的**原始 MIME**，用于判定是否值得走视觉分析
    * @副作用 可能触发一次 LLM 调用（analyzeImage）；触发父组件的 onFileUpload 回调。
    */
-  const handleUploadSuccess = async (data: any, fileType: string) => {
+  const handleUploadSuccess = async (
+    data: any,
+    fileType: string,
+    mimeType: string
+  ) => {
     toast.success("ファイルアップロード成功");
     setUploadProgress(0);
     setIsUploading(false);
@@ -101,8 +133,11 @@ export default function FileUploadBox({
 
     // 仅图片走 LLM 视觉分析：视频/音频当前后端虽有 analyzeVideo 过程，
     // 但本组件不调用（成本高且需要抽帧），故直接把 URL 回调出去即可。
+    // 修复：判定依据从 fileType 改为**原始 MIME**。getFileType() 对 PDF 等
+    //       非 image/video/audio 类型会兜底返回 "image"（因为后端 enum 只有三个值），
+    //       原判定会把 PDF 送进 analyzeImage，白白消耗一次多模态调用且必然失败。
     // 画像の場合は自動的に分析を実行
-    if (fileType === "image") {
+    if (fileType === "image" && mimeType.startsWith("image/")) {
       try {
         // loading toast 无自动关闭时间，必须靠下面的 toast.dismiss() 手动收掉。
         // 注意 dismiss() 不带 id 会关闭**页面上所有** toast（见 observations）。
@@ -138,7 +173,8 @@ export default function FileUploadBox({
    *
    * 服务端 `uploadFile` 的 `fileType` 入参是 `z.enum(["image","video","audio"])`，
    * 不接受第四种值，所以这里必须收敛成三选一 —— 对 PDF 等既不属于三者的类型，
-   * 兜底返回 "image"（这会导致 PDF 被误当成图片送去 LLM 分析，见 observations）。
+   * 兜底返回 "image" 只是为了通过服务端校验；**是否走视觉分析请勿依赖本函数的返回值**，
+   * 改用文件原始 MIME 判定（见 handleUploadSuccess）。
    */
   const getFileType = (file: File): "image" | "video" | "audio" => {
     if (file.type.startsWith("image/")) return "image";
@@ -231,23 +267,7 @@ export default function FileUploadBox({
       // 服务端只要逗号后面的纯 Base64 载荷，所以按 "," split 取 [1]。
       const base64Data = (e.target?.result as string).split(",")[1];
       const fileType = getFileType(selectedFile);
-
-      try {
-        // アップロード
-        const uploadResult = await uploadFileMutation.mutateAsync({
-          filename: selectedFile.name,
-          mimeType: selectedFile.type,
-          fileData: base64Data,
-          fileType,
-        });
-
-        // アップロード成功後、分析を実行
-        await handleUploadSuccess(uploadResult, fileType);
-      } catch (error) {
-        toast.error(`アップロード失敗: ${error instanceof Error ? error.message : "不明なエラー"}`);
-        setUploadProgress(0);
-        setIsUploading(false);
-      }
+      const mimeType = selectedFile.type;
 
       // 「模拟」进度条：tRPC 的 JSON mutation 拿不到 XHR 的 upload progress 事件，
       // 所以用定时器伪造一个递增百分比。
@@ -255,19 +275,44 @@ export default function FileUploadBox({
       //   - +0~30% = 每步随机增量，让进度看起来"不匀速"更像真实网络；
       //   - 封顶 90% = 故意不到 100%，留最后 10% 给真正的完成事件，
       //                避免"进度满了但还没好"的违和感。
-      // ⚠️ 但这段代码写在 try/catch **之后**，即上传早已结束才开始跑，
-      //    此时 isUploading 已被置回 false、进度条已从 DOM 移除，
-      //    定时器完全是空转（且组件卸载时不会清理）。见 observations。
+      // 修复：这段原本写在 try/catch **之后**，上传早已结束才开始跑（此时 isUploading
+      //       已置回 false、进度条已从 DOM 卸载，用户全程看不到进度），且只在 prev>=90
+      //       时才 clearInterval，组件提前卸载就会泄漏。现改为在 mutateAsync **之前**
+      //       启动，并在 finally 中无条件停止（卸载时另有 useEffect 兜底清理）。
       // プログレス表示（シミュレーション）
-      const interval = setInterval(() => {
+      stopProgressSimulation();
+      progressTimerRef.current = setInterval(() => {
         setUploadProgress((prev) => {
           if (prev >= 90) {
-            clearInterval(interval);
+            stopProgressSimulation();
             return 90;
           }
           return prev + Math.random() * 30;
         });
       }, 200);
+
+      try {
+        // アップロード
+        const uploadResult = await uploadFileMutation.mutateAsync({
+          filename: selectedFile.name,
+          mimeType,
+          fileData: base64Data,
+          fileType,
+        });
+
+        // 上传真正完成：先停掉模拟进度并补满到 100%，再进入收尾（可能耗时数秒的 LLM 分析）
+        stopProgressSimulation();
+        setUploadProgress(100);
+
+        // アップロード成功後、分析を実行
+        await handleUploadSuccess(uploadResult, fileType, mimeType);
+      } catch (error) {
+        toast.error(`アップロード失敗: ${error instanceof Error ? error.message : "不明なエラー"}`);
+        setUploadProgress(0);
+        setIsUploading(false);
+      } finally {
+        stopProgressSimulation();
+      }
     };
     reader.readAsDataURL(selectedFile);
   };
@@ -300,17 +345,21 @@ export default function FileUploadBox({
           {/*
             隐藏的原生 file input：整个虚线框的 onClick 通过 ref 代为触发它，
             这样就能自定义外观而不必与浏览器默认的丑陋控件搏斗。
-            注意这里没有像 FilePickerButton 那样重置 value，
-            因此连续选择同一个文件时 onChange 不会二次触发（见 observations）。
+            与 FilePickerButton 一致：每次 change 后都把 value 清空，
+            否则「选 a.png → 点 X 取消 → 再选 a.png」时 value 未变、change 不触发，
+            表现为「点了没反应」。
           */}
           <input
             ref={fileInputRef}
             type="file"
             accept={acceptedFileTypes.join(",")}
             onChange={(e) => {
-              if (e.target.files?.[0]) {
-                handleFileSelect(e.target.files[0]);
+              const file = e.target.files?.[0];
+              if (file) {
+                handleFileSelect(file);
               }
+              // 修复：重置 value，保证重复选择同一个文件仍能触发 change
+              e.target.value = "";
             }}
             className="hidden"
           />

@@ -38,7 +38,9 @@ export function DashboardLayoutSkeleton() {
   return (
     <div className="flex min-h-screen bg-background">
       {/* Sidebar skeleton —— 宽度 280px 必须与 DashboardLayout 的 DEFAULT_WIDTH 保持一致 */}
-      <div className="w-[280px] border-r border-border bg-background p-4 space-y-6">
+      {/* 修复：补上 relative，让下方底部用户信息块的 absolute 相对侧栏定位（原先无 relative 祖先，
+          该块相对视口定位、横跨整个屏幕底部并压住主内容区） */}
+      <div className="relative w-[280px] border-r border-border bg-background p-4 space-y-6">
         {/* Logo area —— 对应真实布局里的「折叠按钮 + Navigation 标题」 */}
         <div className="flex items-center gap-3 px-2">
           <Skeleton className="h-8 w-8 rounded-md" />
@@ -54,9 +56,8 @@ export function DashboardLayoutSkeleton() {
 
         {/*
           User profile area at bottom —— 头像 + 用户名 + 邮箱两行文字的占位。
-          注意：此处用 `absolute` 定位，但最近的祖先并没有 `relative`，
-          因此实际是相对整个视口（initial containing block）定位的，
-          在窄屏下可能与主内容区重叠（详见 observations，未做修改）。
+          `absolute bottom-4 left-4 right-4` 相对**侧栏容器**（已加 relative）定位，
+          因此会贴在侧栏底部内侧，而不会溢出到主内容区。
         */}
         <div className="absolute bottom-4 left-4 right-4">
           <div className="flex items-center gap-3 px-1">

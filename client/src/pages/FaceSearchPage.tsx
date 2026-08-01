@@ -43,6 +43,8 @@ import { useLocation } from "wouter";
  *   - searchMode    当前检索模式（"name" | "image"），决定输入区与结果区的渲染分支
  *   - imagePreview  选中图片的 data URL：既用于右侧缩略图预览，也是上传时 base64 的来源
  *                   （所以它同时承担「预览」和「待上传数据」两个角色）
+ *   - selectedFile  选中的原始 File 对象，仅用于上传时取真实 MIME 与扩展名
+ *                   （accept="image/*" 允许 png/gif/webp，不能一律当作 jpeg）
  *   - actressName   名字检索的受控输入
  *   - isLoading     检索中标志，驱动按钮禁用与全屏 loading 卡片
  *   - nameResults   名字检索结果 { actresses, videos, message }
@@ -56,6 +58,8 @@ export default function FaceSearchPage() {
   const [, setLocation] = useLocation();
   const [searchMode, setSearchMode] = useState<"image" | "name">("name");
   const [imagePreview, setImagePreview] = useState<string>("");
+  // 修复：保留原始 File，上传时才能用真实的 MIME/扩展名（见 handleSearchByImage）
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [actressName, setActressName] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [nameResults, setNameResults] = useState<any>(null);
@@ -72,11 +76,14 @@ export default function FaceSearchPage() {
    * 避免用户反复换图产生大量无用的 S3 对象。
    *
    * @param e file input 的 change 事件
-   * 副作用：设置 imagePreview（data URL 字符串）
+   * 副作用：设置 imagePreview（data URL 字符串）与 selectedFile（原始 File）
    */
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    // 修复：记住原始 File，供上传时读取真实 MIME 与扩展名
+    setSelectedFile(file);
 
     // Show preview
     const reader = new FileReader();
@@ -107,10 +114,17 @@ export default function FaceSearchPage() {
       // imagePreview 形如 "data:image/xxx;base64,AAAA..."，取逗号后的纯 base64 载荷。
       // 文件名带时间戳保证 S3 key 唯一，避免并发检索互相覆盖。
       const base64Data = imagePreview.split(",")[1];
+      // 修复：不再把 MIME 写死成 image/jpeg。file input 的 accept 是 "image/*"，
+      // png/gif/webp 都能选中，写死会让 S3 对象的 Content-Type 与真实内容不符，
+      // CDN/浏览器按 jpeg 解析可能渲染失败。优先用原始 File 的 type，
+      // 退而从 data URL 前缀解析，最后才兜底 jpeg；扩展名同步由 MIME 推导。
+      const mimeType =
+        selectedFile?.type || imagePreview.match(/^data:([^;,]+)/)?.[1] || "image/jpeg";
+      const extension = mimeType.split("/")[1]?.split("+")[0] || "jpg";
       const uploadResult = await uploadFileMutation.mutateAsync({
-        filename: `face-search-${Date.now()}.jpg`,
+        filename: `face-search-${Date.now()}.${extension}`,
         fileData: base64Data,
-        mimeType: "image/jpeg",
+        mimeType,
         fileType: "image",
       });
 

@@ -23,7 +23,7 @@
  * - 下游工具：`@/lib/videoUrl` 的 `resolveVideoUrl`。
  *
  * ## 渲染状态机（自上而下短路返回，顺序不可调换）
- *   1. `!videoId`            → 转圈（URL 无 id 或解析失败）
+ *   1. `!videoId`            → 「ビデオが見つかりません」卡片（URL 无 id 或 id 非法）
  *   2. `videoQuery.isLoading`→ 转圈
  *   3. `isError || !data`    → 「ビデオが見つかりません」卡片
  *   4. 正常                  → 完整详情页
@@ -58,9 +58,12 @@ export default function VideoDetailPage() {
   // 组件既然被渲染出来，说明路由必然已匹配，无需再判断第一个返回值。
   const [, params] = useRoute("/video/:id");
   // path 参数永远是字符串，后端 zod schema 要求 number，故此处转换。
-  // ⚠️ `parseInt` 对非数字串返回 NaN，而 NaN 是假值，会一路走到下面
-  //    `if (!videoId)` 的分支 —— 表现为**永久转圈**而不是「未找到」（见 observations）。
-  const videoId = params?.id ? parseInt(params.id) : null;
+  // 修复：改用 Number() + Number.isInteger 严格校验，非法 id 归一为 null。
+  //   - 原先的 `parseInt` 对 "abc" 返回 NaN、对 "12abc" 返回 12（会去请求视频 12）；
+  //   - NaN 是假值，会命中下方 `if (!videoId)` 分支，而该分支旧实现渲染的是转圈，
+  //     表现为**永久加载态**。现在该分支改为渲染「ビデオが見つかりません」。
+  const parsedId = params?.id !== undefined ? Number(params.id) : NaN;
+  const videoId = Number.isInteger(parsedId) && parsedId > 0 ? parsedId : null;
 
   // 主查询。`videoId || 0` 只是为了满足入参类型（zod 要求 positive int，0 会被拒），
   // 真正的守卫是 `enabled: !!videoId` —— id 缺失时根本不会发出请求。
@@ -92,10 +95,11 @@ export default function VideoDetailPage() {
   /**
    * 分享当前视频。
    * @副作用 支持 Web Share API 的环境（主要是移动端浏览器）调起系统分享面板；
-   *         否则只弹一个 toast 提示。
+   *         否则把当前页 URL 写入系统剪贴板。
    *
-   * ⚠️ 降级分支只显示「リンクをコピーしました」，**并没有真的写入剪贴板**
-   *    （缺少 `navigator.clipboard.writeText` 调用），见 observations。
+   * 降级分支说明：`navigator.clipboard` 仅在安全上下文（https / localhost）下可用，
+   * 且 writeText 是异步的、可能被用户拒权而 reject —— 因此成功提示放在 then 里，
+   * 失败时给出明确的错误提示，避免"提示成功但剪贴板是空的"。
    */
   const handleShare = () => {
     if (navigator.share) {
@@ -104,8 +108,15 @@ export default function VideoDetailPage() {
         text: videoQuery.data?.description || "",
         url: window.location.href,
       });
+    } else if (navigator.clipboard?.writeText) {
+      // 修复：降级分支此前只弹「リンクをコピーしました」而从未调用剪贴板 API，
+      //       这里补上真实的 writeText，并按结果分别提示成功/失败。
+      navigator.clipboard
+        .writeText(window.location.href)
+        .then(() => toast.success("リンクをコピーしました"))
+        .catch(() => toast.error("リンクのコピーに失敗しました"));
     } else {
-      toast.success("リンクをコピーしました");
+      toast.error("リンクのコピーに失敗しました");
     }
   };
 
@@ -114,14 +125,21 @@ export default function VideoDetailPage() {
   // 它们都在所有 Hook 调用**之后**，符合 Hooks 规则（不能条件式调用 Hook）。
   // --------------------------------------------------------------------------
 
-  // 分支 1：URL 里没有可用的 id。此时请求根本没发出，
-  // 用转圈占位（严格说这里更适合展示「未找到」，见 observations）。
+  // 「未找到」卡片：无效 id（分支 1）与请求失败/无数据（分支 3）共用同一视图。
+  const notFoundView = (
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 to-slate-950 text-white flex items-center justify-center">
+      <Card className="bg-slate-800 border-slate-700 max-w-md">
+        <CardContent className="p-6 text-center">
+          <p className="text-slate-300">ビデオが見つかりません</p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // 分支 1：URL 里没有可用的 id（缺失或非正整数）。此时请求根本没发出，
+  // 修复：改为直接展示「未找到」，而不是永远转不完的 Loader2。
   if (!videoId) {
-    return (
-      <div className="flex justify-center items-center h-screen">
-        <Loader2 className="w-8 h-8 text-slate-500 animate-spin" />
-      </div>
-    );
+    return notFoundView;
   }
 
   // 分支 2：请求进行中。
@@ -137,15 +155,7 @@ export default function VideoDetailPage() {
   // 后端在视频不存在时抛的是普通 Error（映射为 500）而非 NOT_FOUND，
   // 前端无法区分「视频不存在」与「数据库故障」，故这里合并成同一个文案。
   if (videoQuery.isError || !videoQuery.data) {
-    return (
-      <div className="min-h-screen bg-gradient-to-b from-slate-900 to-slate-950 text-white flex items-center justify-center">
-        <Card className="bg-slate-800 border-slate-700 max-w-md">
-          <CardContent className="p-6 text-center">
-            <p className="text-slate-300">ビデオが見つかりません</p>
-          </CardContent>
-        </Card>
-      </div>
-    );
+    return notFoundView;
   }
 
   // 走到这里 data 必然存在（上面三个分支已排除全部空态），

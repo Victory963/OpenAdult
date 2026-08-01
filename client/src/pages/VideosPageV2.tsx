@@ -72,8 +72,9 @@ export default function VideosPageV2() {
   const offset = page * limit;
 
   // 视频列表。入参对象即缓存键，limit/offset/category/sortBy 任一变化都会自动重查。
-  // 注意：切换排序或分类时**没有重置 page**，若当前停在第 3 页，
-  // 换分类后仍从 offset=40 开始取，很可能直接是空结果（见 observations）。
+  // 修复：切换排序/分类时会同时 `setPage(0)`（见下方三处按钮的 onClick），
+  // 否则停在第 3 页换分类会继续带着 offset=40 去查，新分类往往不足 40 条 →
+  // 返回空数组 → 误显示「動画が見つかりません」。与 V1 的 handleCategoryChange 行为对齐。
   // Fetch videos
   const videosQuery = trpc.videosV2.list.useQuery({
     limit,
@@ -139,7 +140,11 @@ export default function VideosPageV2() {
                   key={sort}
                   variant={sortBy === sort ? "default" : "outline"}
                   size="sm"
-                  onClick={() => setSortBy(sort)}
+                  // 修复：换排序必须回到第 1 页（0-based 的 0），否则沿用旧 offset 会取到空页
+                  onClick={() => {
+                    setSortBy(sort);
+                    setPage(0);
+                  }}
                   className={sortBy === sort ? "bg-purple-600" : ""}
                 >
                   {sort === "newest" && "最新"}
@@ -155,7 +160,11 @@ export default function VideosPageV2() {
                 <Button
                   variant={!selectedCategory ? "default" : "outline"}
                   size="sm"
-                  onClick={() => setSelectedCategory(undefined)}
+                  // 修复：切回「すべて」同样要重置页码
+                  onClick={() => {
+                    setSelectedCategory(undefined);
+                    setPage(0);
+                  }}
                   className={!selectedCategory ? "bg-purple-600" : ""}
                 >
                   すべて
@@ -165,7 +174,11 @@ export default function VideosPageV2() {
                     key={category}
                     variant={selectedCategory === category ? "default" : "outline"}
                     size="sm"
-                    onClick={() => setSelectedCategory(category)}
+                    // 修复：换分类必须回到第 1 页，否则新分类不足一页时会显示成「无内容」
+                    onClick={() => {
+                      setSelectedCategory(category);
+                      setPage(0);
+                    }}
                     className={selectedCategory === category ? "bg-purple-600" : ""}
                   >
                     {category}

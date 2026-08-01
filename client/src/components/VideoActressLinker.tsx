@@ -14,21 +14,21 @@
  * 上下游依赖：
  *   ← 管理面板中需要为单个视频挂女优的场景
  *   → trpc.videos.getActresses  取全量女优列表（**V1 路由**，注意不是 actressManagementV2）
+ *   → trpc.videos.getById       取该视频**已有的**女优关联，用于初始化选中名单
  *   → trpc.videos.update        提交 { videoId, actressIds } 覆盖式更新关联
  *
  * 交互模型（全量覆盖，非增量）：
- *   本地维护 selectedActresses 数组 → 点保存时把整个数组提交给 videos.update，
+ *   挂载时先用 videos.getById 把已有关联灌进 selectedActresses →
+ *   用户在此基础上增删 → 点保存时把整个数组提交给 videos.update，
  *   服务端按"先删后插"的方式重建该视频的关联。因此**必须一次性提交完整名单**，
  *   漏选等于删除。
  *
  * ⚠️ 已知偏差（不在本次注释任务的修改范围内，仅记录）：
  *   - `handleAISearch` 名为「AI 检索」，实际只做本地 `String.includes` 子串匹配，
  *     没有调用任何 LLM 或 faceSearch 接口。UI 文案「AI検索で女優を追加」与实现不符。
- *   - 组件挂载时不会拉取该视频**已有的**女优关联，selectedActresses 始终从空开始。
- *     若用户只想追加一人就保存，原有关联会被覆盖清空。
  */
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Search, Plus, X, Loader2, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -70,7 +70,26 @@ export default function VideoActressLinker({
   // 因此输入时无网络请求、响应即时；代价是女优表变大后首屏 payload 会线性增长。
   const actressesQuery = trpc.videos.getActresses.useQuery();
 
+  // 修复：拉取该视频**已有的**女优关联，用于初始化 selectedActresses。
+  // 此前 selectedActresses 恒从空数组开始，而 handleSave 是全量覆盖语义
+  // （videos.update 会先删后插重建关联），用户只想补加 1 人时会把原有关联全部删掉。
+  const videoDetailQuery = trpc.videos.getById.useQuery(
+    { videoId },
+    { enabled: !!videoId, retry: false }
+  );
 
+  // 只灌一次：后续的 refetch（窗口聚焦等）不得覆盖用户已经做过的增删
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (seededRef.current) return;
+    const linked = videoDetailQuery.data?.actresses;
+    if (!linked) return;
+    seededRef.current = true;
+    // 用并集而非直接覆盖：请求返回前用户可能已经手动添加过人，直接覆盖会把这些操作吞掉
+    setSelectedActresses((prev) =>
+      Array.from(new Set([...linked.map((a: any) => a.id as number), ...prev]))
+    );
+  }, [videoDetailQuery.data]);
 
   // Update video with actress links
   const updateVideoMutation = trpc.videos.update.useMutation();

@@ -229,6 +229,7 @@ function formatTime(seconds: number): string {
  * @param sessionId  initSession 返回的会话 ID
  * @param chunkIndex 分片序号（从 0 开始）。服务端据此定位偏移量，因此**允许乱序到达**
  * @param chunkBlob  File.slice() 得到的分片，浏览器不会立即读进内存
+ * @param signal     取消信号，透传给 fetch —— 取消时在途请求会立刻中断（抛 AbortError）
  * @returns 服务端返回的 `{ success, progress }`（progress 为服务端视角的整体进度）
  *
  * @throws Error 非 2xx 响应时抛出，message 优先取响应体的 error 字段，
@@ -241,7 +242,8 @@ function formatTime(seconds: number): string {
 async function uploadChunkBinary(
   sessionId: string,
   chunkIndex: number,
-  chunkBlob: Blob
+  chunkBlob: Blob,
+  signal?: AbortSignal
 ): Promise<{ success: boolean; progress: number }> {
   const formData = new FormData();
   formData.append("sessionId", sessionId);
@@ -252,6 +254,10 @@ async function uploadChunkBinary(
     method: "POST",
     body: formData,
     credentials: "include", // Include cookies for auth
+    // 修复：把取消信号透传给 fetch。此前 signal 只在 worker 每轮循环开头检查，
+    // 已在途的分片请求（最多 PARALLEL_UPLOADS × CHUNK_SIZE）会继续跑完才停，
+    // 取消不是即时生效的。
+    signal,
   });
 
   if (!response.ok) {
@@ -315,7 +321,8 @@ async function uploadChunksParallel(
       let retries = 3;
       while (retries > 0) {
         try {
-          await uploadChunkBinary(sessionId, chunkIndex, chunkBlob);
+          // 修复：把 signal 一并交给 fetch，取消时在途请求立即中断
+          await uploadChunkBinary(sessionId, chunkIndex, chunkBlob, signal);
           completedChunks++;
           totalBytesUploaded += (end - start);
           // 速率用「累计字节 / 累计耗时」的平均值而非瞬时值：
@@ -325,6 +332,8 @@ async function uploadChunksParallel(
           onProgress(completedChunks, speed);
           break;
         } catch (err: any) {
+          // 修复：已被取消时立即上抛，不再消耗 3 次重试与退避等待
+          if (signal?.aborted) throw err;
           retries--;
           if (retries === 0) {
             // 触发熔断并让 Promise.all 立即 reject
@@ -364,7 +373,8 @@ async function uploadChunksParallel(
  * Ref 职责：
  *   fileInputRef / thumbnailInputRef —— 隐藏的 <input type=file>，靠按钮 click() 唤起
  *   dropZoneRef      —— 拖拽高亮直接操作 classList，绕开 React 重渲染（拖拽事件极高频）
- *   abortControllerRef —— 取消上传用的信号源
+ *   abortControllersRef —— sessionId → AbortController 的映射。多文件是并发上传的，
+ *                       必须一任务一信号源，否则「取消 A」会中止到别的任务上。
  */
 export default function VideoUploadForm() {
   const [uploadingFiles, setUploadingFiles] = useState<UploadingFile[]>([]);
@@ -378,7 +388,10 @@ export default function VideoUploadForm() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const thumbnailInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  // 修复：由单一 ref 改为按 sessionId 索引的 Map。
+  // handleFileSelect 会对多个文件并发调用 uploadFile，单 ref 会被后来者覆盖，
+  // 结果是对文件 A 点「取消」实际中止了最后创建的那个 controller（可能属于文件 B）。
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   const initSessionMutation = trpc.videoUploadV2.initSession.useMutation();
   const completeUploadMutation = trpc.videoUploadV2.completeUpload.useMutation();
@@ -426,8 +439,8 @@ export default function VideoUploadForm() {
       }
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      // 每个文件独占一个 AbortController，拿到 sessionId 后再注册进 Map
       const abortController = new AbortController();
-      abortControllerRef.current = abortController;
 
       // Extract thumbnail and duration
       // 手动封面优先；只有没设手动封面时才做自动抽帧。
@@ -447,6 +460,9 @@ export default function VideoUploadForm() {
         }
       }
 
+      // 提到 try 之外声明：finally 里要按这个 key 把 controller 从 Map 中摘除
+      let registeredSessionId: string | null = null;
+
       try {
         // Initialize upload session (still via tRPC - small payload)
         // 控制面仍走 tRPC：payload 只有文件名/大小/分片数/封面 dataURL，体积可控
@@ -460,6 +476,9 @@ export default function VideoUploadForm() {
           duration: videoDuration || undefined,
         });
         const sessionId = sessionResult.sessionId;
+        // 修复：以 sessionId 为键登记本任务的 controller，取消时才能精确命中
+        abortControllersRef.current.set(sessionId, abortController);
+        registeredSessionId = sessionId;
 
         // Add to uploading files
         setUploadingFiles((prev) => [
@@ -538,6 +557,10 @@ export default function VideoUploadForm() {
           );
         }, 5000);
       } catch (err: any) {
+        // 修复：用户主动取消时不再弹错误 toast —— cancelUpload 已经给过提示，
+        // 且此时抛出的是 fetch 的 AbortError，文案对用户毫无意义
+        if (abortController.signal.aborted) return;
+
         const errorMessage = err?.message || "Upload failed";
         // 用 fileName + status 定位失败项而不是 sessionId：
         // initSession 阶段就失败时根本还没有 sessionId 可用
@@ -549,6 +572,11 @@ export default function VideoUploadForm() {
           )
         );
         toast.error(errorMessage);
+      } finally {
+        // 无论成功、失败还是取消，都要摘掉 Map 里的条目，避免 controller 常驻内存
+        if (registeredSessionId) {
+          abortControllersRef.current.delete(registeredSessionId);
+        }
       }
     },
     [initSessionMutation, completeUploadMutation, thumbnailOptions, manualThumbnail]
@@ -591,13 +619,16 @@ export default function VideoUploadForm() {
   };
 
   /**
-   * 取消上传：拉起 abort 信号让 worker 在下一轮循环退出，并把该项从列表移除。
+   * 取消上传：拉起该会话专属的 abort 信号（会同时中断在途的 fetch 请求、
+   * 并让 worker 在下一轮循环退出），并把该项从列表移除。
    *
    * 注意服务端**不会**被通知取消，已上传的分片会以孤儿会话形式留在
    * video_upload_sessions / S3 中，需要靠服务端的过期清理任务回收。
    */
   const cancelUpload = (sessionId: string) => {
-    abortControllerRef.current?.abort();
+    // 修复：只中止该 sessionId 对应的 controller，不再误伤其它并发上传任务
+    abortControllersRef.current.get(sessionId)?.abort();
+    abortControllersRef.current.delete(sessionId);
     setUploadingFiles((prev) => prev.filter((f) => f.sessionId !== sessionId));
     toast.info("アップロードをキャンセルしました");
   };

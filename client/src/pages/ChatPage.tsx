@@ -158,6 +158,24 @@ export default function ChatPage() {
           setIsLoading(false);
         }
       };
+      // 修复：注册 onerror/onabort 解除 isLoading 死锁。
+      // readAsDataURL 是异步的，读取失败（文件被移除/无权限/超大）时 onload 永不触发，
+      // 外层 try/catch 也捕获不到，会让 isLoading 永久停在 true —— 发送按钮与两个
+      // 文件选择按钮被永久禁用，只能刷新页面恢复。
+      reader.onerror = () => {
+        console.error("File read error:", reader.error);
+        const errorMessage: Message = {
+          id: Date.now(),
+          role: "assistant",
+          content: "顔認識に失敗しました。別の画像をお試しください。",
+          createdAt: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+        setIsLoading(false);
+      };
+      reader.onabort = () => {
+        setIsLoading(false);
+      };
       // 注意：readAsDataURL 是异步的，真正的业务逻辑都在上面的 onload 回调里，
       // 外层 try/catch 只能捕获 readAsDataURL 本身的同步异常
       reader.readAsDataURL(file);
@@ -212,6 +230,15 @@ export default function ChatPage() {
         } finally {
           setIsLoading(false);
         }
+      };
+      // 修复：同 handleFaceSearchFileSelect —— 异步读取失败必须解除 isLoading，
+      // 否则整个输入区（发送 + 两个文件选择按钮）会被永久禁用
+      reader.onerror = () => {
+        console.error("File read error:", reader.error);
+        setIsLoading(false);
+      };
+      reader.onabort = () => {
+        setIsLoading(false);
       };
       reader.readAsDataURL(file);
     } catch (error) {
